@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Color } from 'three'
+import CameraControls from 'camera-controls'
 import { IfcViewerAPI } from 'web-ifc-viewer'
 
 type IfcViewerProps = {
@@ -9,6 +10,25 @@ type IfcViewerProps = {
 
 type Loader = (viewer: IfcViewerAPI) => Promise<any>
 
+type SelectedElement = {
+  modelID: number
+  expressID: number
+  type?: string
+}
+
+type PropertyField = {
+  key: string
+  label: string
+  value: string
+}
+
+type SpatialTreeNode = {
+  expressID: number
+  type: string
+  name: string
+  children: SpatialTreeNode[]
+}
+
 const wasmRootPath = '/ifc/'
 
 const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
@@ -16,8 +36,19 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   const viewerRef = useRef<IfcViewerAPI | null>(null)
   const lastModelIdRef = useRef<number | null>(null)
   const loadTokenRef = useRef(0)
+  const propertyRequestRef = useRef(0)
+  const treeRequestRef = useRef(0)
+  const spatialIndexRef = useRef<Map<number, number[]>>(new Map())
   const [status, setStatus] = useState<string | null>('Loading sample model...')
   const [error, setError] = useState<string | null>(null)
+  const [selectedElement, setSelectedElement] = useState<SelectedElement | null>(null)
+  const [propertyFields, setPropertyFields] = useState<PropertyField[]>([])
+  const [propertyError, setPropertyError] = useState<string | null>(null)
+  const [isFetchingProperties, setIsFetchingProperties] = useState(false)
+  const [spatialTree, setSpatialTree] = useState<SpatialTreeNode | null>(null)
+  const [spatialTreeError, setSpatialTreeError] = useState<string | null>(null)
+  const [isFetchingSpatialTree, setIsFetchingSpatialTree] = useState(false)
+  const [expandedNodes, setExpandedNodes] = useState<Set<number>>(() => new Set())
 
   // Lazy-initialize the underlying IfcViewerAPI once the div ref is ready
   const ensureViewer = useCallback(() => {
@@ -34,10 +65,379 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     viewer.grid.setGrid()
     viewer.IFC.setWasmPath(wasmRootPath)
     viewer.context.renderer.postProduction.active = true
+    const cameraControls = viewer.context.ifcCamera.cameraControls
+    cameraControls.mouseButtons.left = CameraControls.ACTION.NONE
+    cameraControls.mouseButtons.middle = CameraControls.ACTION.ROTATE
+    cameraControls.mouseButtons.right = CameraControls.ACTION.TRUCK
+    cameraControls.mouseButtons.wheel = CameraControls.ACTION.DOLLY
 
     viewerRef.current = viewer
     return viewer
   }, [])
+
+  const resetSelection = useCallback(() => {
+    propertyRequestRef.current += 1
+    setSelectedElement(null)
+    setPropertyFields([])
+    setPropertyError(null)
+    setIsFetchingProperties(false)
+  }, [])
+
+  const resetSpatialTree = useCallback(() => {
+    treeRequestRef.current += 1
+    spatialIndexRef.current.clear()
+    setSpatialTree(null)
+    setSpatialTreeError(null)
+    setIsFetchingSpatialTree(false)
+    setExpandedNodes(new Set())
+  }, [])
+
+  const normalizeIfcValue = useCallback((rawValue: any): string => {
+    if (rawValue === null || rawValue === undefined) {
+      return ''
+    }
+    if (typeof rawValue === 'object') {
+      if ('value' in rawValue) {
+        return rawValue.value === null || rawValue.value === undefined
+          ? ''
+          : String(rawValue.value)
+      }
+      if (Array.isArray(rawValue)) {
+        return rawValue.map((entry) => normalizeIfcValue(entry)).join(', ')
+      }
+      return ''
+    }
+    return String(rawValue)
+  }, [])
+
+  const mapSpatialNode = useCallback(
+    (rawNode: any): SpatialTreeNode | null => {
+      if (!rawNode || typeof rawNode !== 'object') {
+        return null
+      }
+
+      const expressID =
+        typeof rawNode.expressID === 'number'
+          ? rawNode.expressID
+          : typeof rawNode.expressId === 'number'
+            ? rawNode.expressId
+            : typeof rawNode.id === 'number'
+              ? rawNode.id
+              : null
+
+      if (expressID === null) {
+        return null
+      }
+
+      const type =
+        typeof rawNode.type === 'string'
+          ? rawNode.type
+          : typeof rawNode.ifcClass === 'string'
+            ? rawNode.ifcClass
+            : 'IFCENTITY'
+
+      const labelCandidates = [
+        rawNode.Name,
+        rawNode.name,
+        rawNode.LongName,
+        rawNode.ObjectType,
+        rawNode.Description
+      ]
+
+      const name =
+        labelCandidates
+          .map((candidate) => {
+            if (typeof candidate === 'string') {
+              return candidate
+            }
+            return normalizeIfcValue(candidate)
+          })
+          .find((candidate) => candidate && candidate.trim().length > 0) || `${type} #${expressID}`
+
+      const childEntries = Object.entries(rawNode).filter(
+        ([key, value]) => Array.isArray(value) && /children|items/i.test(key)
+      )
+
+      const children = childEntries
+        .flatMap(([, value]) => value as any[])
+        .map((child) => mapSpatialNode(child))
+        .filter((child): child is SpatialTreeNode => Boolean(child))
+
+      return {
+        expressID,
+        type,
+        name,
+        children
+      }
+    },
+    [normalizeIfcValue]
+  )
+
+  const rebuildSpatialIndex = useCallback((root: SpatialTreeNode | null) => {
+    spatialIndexRef.current.clear()
+    const initiallyExpanded = new Set<number>()
+
+    if (!root) {
+      return initiallyExpanded
+    }
+
+    const traverse = (node: SpatialTreeNode, ancestors: number[]) => {
+      spatialIndexRef.current.set(node.expressID, ancestors)
+      node.children.forEach((child) => traverse(child, [...ancestors, node.expressID]))
+    }
+
+    traverse(root, [])
+    initiallyExpanded.add(root.expressID)
+    root.children.forEach((child) => initiallyExpanded.add(child.expressID))
+    return initiallyExpanded
+  }, [])
+
+  const expandToNode = useCallback((expressID: number) => {
+    const ancestors = spatialIndexRef.current.get(expressID)
+    if (!ancestors) {
+      return
+    }
+
+    setExpandedNodes((prev) => {
+      const next = new Set(prev)
+      ancestors.forEach((ancestorID) => next.add(ancestorID))
+      next.add(expressID)
+      return next
+    })
+  }, [])
+
+  const buildPropertyFields = useCallback(
+    (rawProperties: any): PropertyField[] => {
+      if (!rawProperties) {
+        return []
+      }
+
+      const fields: PropertyField[] = []
+      const preferredKeys = [
+        'GlobalId',
+        'Name',
+        'Description',
+        'ObjectType',
+        'PredefinedType',
+        'Tag'
+      ]
+
+      const seenKeys = new Set<string>()
+      const addField = (key: string, label: string, rawValue: any) => {
+        const normalized = normalizeIfcValue(rawValue)
+        if (normalized === '' && normalized !== rawValue) {
+          // Skip empty derived values to avoid noise
+          return
+        }
+        const uniqueKey = seenKeys.has(key) ? `${key}-${seenKeys.size}` : key
+        seenKeys.add(uniqueKey)
+        fields.push({
+          key: uniqueKey,
+          label,
+          value: normalized
+        })
+      }
+
+      preferredKeys.forEach((key) => {
+        if (rawProperties[key] !== undefined) {
+          addField(key, key, rawProperties[key])
+        }
+      })
+
+      Object.entries(rawProperties).forEach(([key, value]) => {
+        if (preferredKeys.includes(key)) {
+          return
+        }
+        if (
+          typeof value === 'string' ||
+          typeof value === 'number' ||
+          typeof value === 'boolean'
+        ) {
+          addField(key, key, value)
+        } else if (value && typeof value === 'object' && 'value' in value) {
+          addField(key, key, value)
+        }
+      })
+
+      if (Array.isArray(rawProperties.psets)) {
+        rawProperties.psets.forEach((pset: any, psetIndex: number) => {
+          const setName =
+            normalizeIfcValue(pset?.Name) || `Property Set ${psetIndex + 1}`
+          const properties = Array.isArray(pset?.HasProperties) ? pset.HasProperties : []
+          properties.forEach((prop: any, propIndex: number) => {
+            const propName =
+              normalizeIfcValue(prop?.Name) || `Property ${propIndex + 1}`
+            const propValue =
+              prop?.NominalValue ??
+              prop?.LengthValue ??
+              prop?.AreaValue ??
+              prop?.VolumeValue ??
+              prop?.BooleanValue ??
+              prop?.IntegerValue ??
+              prop?.RealValue ??
+              prop?.Value ??
+              prop
+
+            const key = `pset-${pset?.expressID ?? psetIndex}-${prop?.expressID ?? propIndex}`
+            addField(key, `${setName} / ${propName}`, propValue)
+          })
+        })
+      }
+
+      return fields.slice(0, 60)
+    },
+    [normalizeIfcValue]
+  )
+
+  const fetchSpatialTree = useCallback(
+    async (modelID: number) => {
+      const viewer = viewerRef.current
+      if (!viewer) return
+
+      const requestToken = ++treeRequestRef.current
+      setIsFetchingSpatialTree(true)
+      setSpatialTreeError(null)
+
+      try {
+        const rawStructure = await viewer.IFC.getSpatialStructure(modelID, true)
+        if (treeRequestRef.current !== requestToken) {
+          return
+        }
+
+        const mappedTree = mapSpatialNode(rawStructure)
+        setSpatialTree(mappedTree)
+        setExpandedNodes(rebuildSpatialIndex(mappedTree))
+      } catch (err) {
+        if (treeRequestRef.current !== requestToken) {
+          return
+        }
+        console.error('Failed to read IFC spatial structure', err)
+        setSpatialTree(null)
+        setExpandedNodes(new Set())
+        setSpatialTreeError('Unable to read IFC spatial structure.')
+      } finally {
+        if (treeRequestRef.current === requestToken) {
+          setIsFetchingSpatialTree(false)
+        }
+      }
+    },
+    [mapSpatialNode, rebuildSpatialIndex]
+  )
+
+  const fetchProperties = useCallback(
+    async (modelID: number, expressID: number) => {
+      const viewer = viewerRef.current
+      if (!viewer) return
+
+      const requestToken = ++propertyRequestRef.current
+      setIsFetchingProperties(true)
+      setPropertyError(null)
+
+      try {
+        const properties = await viewer.IFC.getProperties(modelID, expressID, true, true)
+        if (!properties) {
+          throw new Error('No properties returned for this element.')
+        }
+        if (propertyRequestRef.current !== requestToken) {
+          return
+        }
+
+        setSelectedElement({
+          modelID,
+          expressID,
+          type: properties.type ?? properties.ifcClass
+        })
+        expandToNode(expressID)
+        setPropertyFields(buildPropertyFields(properties))
+      } catch (err) {
+        if (propertyRequestRef.current !== requestToken) {
+          return
+        }
+        console.error('Failed to load IFC properties', err)
+        setPropertyError('Unable to load IFC properties for the selected element.')
+        setSelectedElement(null)
+        setPropertyFields([])
+      } finally {
+        if (propertyRequestRef.current === requestToken) {
+          setIsFetchingProperties(false)
+        }
+      }
+    },
+    [buildPropertyFields, expandToNode]
+  )
+
+  const handleFieldChange = useCallback((key: string, value: string) => {
+    setPropertyFields((prev) =>
+      prev.map((field) => (field.key === key ? { ...field, value } : field))
+    )
+  }, [])
+
+  const toggleNode = useCallback((expressID: number) => {
+    setExpandedNodes((prev) => {
+      const next = new Set(prev)
+      if (next.has(expressID)) {
+        next.delete(expressID)
+      } else {
+        next.add(expressID)
+      }
+      return next
+    })
+  }, [])
+
+  const handleNodeSelect = useCallback(
+    async (node: SpatialTreeNode) => {
+      const viewer = viewerRef.current
+      const modelID = lastModelIdRef.current
+      if (!viewer || modelID === null) {
+        return
+      }
+
+      try {
+        await viewer.IFC.selector.pickIfcItemsByID(modelID, [node.expressID], true, true)
+      } catch (err) {
+        console.warn('Failed to highlight selection from tree', err)
+      }
+
+      await fetchProperties(modelID, node.expressID)
+    },
+    [fetchProperties]
+  )
+
+  const handlePick = useCallback(async () => {
+    const viewer = viewerRef.current
+    if (!viewer) {
+      return
+    }
+
+    try {
+      const picked = await viewer.IFC.selector.pickIfcItem(true)
+      if (!picked || picked.id === undefined || picked.modelID === undefined) {
+        viewer.IFC.selector.unpickIfcItems()
+        resetSelection()
+        return
+      }
+
+      await fetchProperties(picked.modelID, picked.id)
+    } catch (err) {
+      console.error('Failed to pick IFC item', err)
+      resetSelection()
+    }
+  }, [fetchProperties, resetSelection])
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.button !== 0) return
+      handlePick()
+    }
+
+    container.addEventListener('pointerdown', handlePointerDown)
+    return () => {
+      container.removeEventListener('pointerdown', handlePointerDown)
+    }
+  }, [handlePick])
 
   // Helper to sequentially load models and clean up/abort overlapping requests
   const loadModel = useCallback(
@@ -49,6 +449,8 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
 
       setStatus(message)
       setError(null)
+      resetSelection()
+      resetSpatialTree()
 
       if (lastModelIdRef.current !== null) {
         viewer.IFC.removeIfcModel(lastModelIdRef.current)
@@ -70,6 +472,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
 
         if (model.modelID !== undefined) {
           lastModelIdRef.current = model.modelID
+          fetchSpatialTree(model.modelID)
         }
         setStatus(null)
       } catch (err) {
@@ -81,7 +484,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
         setStatus(null)
       }
     },
-    [ensureViewer]
+    [ensureViewer, fetchSpatialTree, resetSelection, resetSpatialTree]
   )
 
   useEffect(() => {
@@ -114,9 +517,79 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
 
   return (
     <div className="viewer-wrapper">
-      <div ref={containerRef} className="viewer-container" />
-      {status && <div className="viewer-overlay">{status}</div>}
-      {error && <div className="viewer-overlay viewer-overlay--error">{error}</div>}
+      <div className="viewer-layout">
+        <div className="viewer-stage">
+          <div ref={containerRef} className="viewer-container" />
+          {status && <div className="viewer-overlay">{status}</div>}
+          {error && <div className="viewer-overlay viewer-overlay--error">{error}</div>}
+        </div>
+        <aside className="properties-panel">
+          <header className="properties-panel__header">
+            <h2>Element properties</h2>
+            {selectedElement && (
+              <p className="properties-panel__meta">
+                #{selectedElement.expressID}{' '}
+                {selectedElement.type ? `· ${selectedElement.type}` : ''}
+              </p>
+            )}
+          </header>
+          <div className="properties-panel__content">
+            {isFetchingProperties && (
+              <p className="properties-panel__status">Loading properties…</p>
+            )}
+            {propertyError && (
+              <p className="properties-panel__status properties-panel__status--error">
+                {propertyError}
+              </p>
+            )}
+            {!isFetchingProperties && !propertyError && !selectedElement && (
+              <p className="properties-panel__status">
+                Click any element in the scene to inspect and edit its metadata.
+              </p>
+            )}
+            {!isFetchingProperties && !propertyError && selectedElement && (
+              <>
+                <form className="properties-form">
+                  {propertyFields.length > 0 ? (
+                    propertyFields.map((field) => {
+                      const isLongValue = field.value.length > 60 || field.value.includes('\n')
+                      return (
+                        <label key={field.key} className="properties-form__field">
+                          <span>{field.label}</span>
+                          {isLongValue ? (
+                            <textarea
+                              value={field.value}
+                              onChange={(event) =>
+                                handleFieldChange(field.key, event.target.value)
+                              }
+                              rows={Math.min(6, Math.max(2, Math.ceil(field.value.length / 60)))}
+                            />
+                          ) : (
+                            <input
+                              type="text"
+                              value={field.value}
+                              onChange={(event) =>
+                                handleFieldChange(field.key, event.target.value)
+                              }
+                            />
+                          )}
+                        </label>
+                      )
+                    })
+                  ) : (
+                    <p className="properties-panel__status">
+                      This element does not expose any simple IFC attributes.
+                    </p>
+                  )}
+                </form>
+                <p className="properties-panel__hint">
+                  Changes are stored only in memory for now; backend sync will come later.
+                </p>
+              </>
+            )}
+          </div>
+        </aside>
+      </div>
     </div>
   )
 }

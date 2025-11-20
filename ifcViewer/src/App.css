@@ -64,9 +64,20 @@
 }
 
 .viewer-wrapper {
-  position: relative;
   width: 100%;
   height: 100%;
+}
+
+.viewer-layout {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+.viewer-stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
 }
 
 .viewer-container {
@@ -87,4 +98,92 @@
 
 .viewer-overlay--error {
   background: rgba(220, 38, 38, 0.9);
+}
+
+.properties-panel {
+  width: 320px;
+  border-left: 1px solid #e2e8f0;
+  background: #f8fafc;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.properties-panel__header h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.properties-panel__meta {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  color: #475569;
+}
+
+.properties-panel__content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.properties-panel__status {
+  margin: 0;
+  padding: 0.5rem 0;
+  color: #475569;
+  font-size: 0.9rem;
+}
+
+.properties-panel__status--error {
+  color: #dc2626;
+}
+
+.properties-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.properties-form__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+}
+
+.properties-form__field span {
+  color: #475569;
+  font-weight: 600;
+}
+
+.properties-form__field input,
+.properties-form__field textarea {
+  border: 1px solid #cbd5f5;
+  border-radius: 0.4rem;
+  padding: 0.4rem 0.55rem;
+  font-size: 0.9rem;
+  width: 100%;
+  font-family: inherit;
+}
+
+.properties-form__field textarea {
+  resize: vertical;
+}
+
+.properties-panel__hint {
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+@media (max-width: 960px) {
+  .viewer-layout {
+    flex-direction: column;
+  }
+
+  .properties-panel {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid #e2e8f0;
+  }
 }
