@@ -25,6 +25,7 @@ function App() {
         </p>
       </header>
 
+      {/* Viewer mounts here and receives either the picked file or the default sample */}
       <section className="viewer-shell">
         <IfcViewer file={selectedFile ?? undefined} />
       </section>

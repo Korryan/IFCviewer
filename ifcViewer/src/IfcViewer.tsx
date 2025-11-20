@@ -19,6 +19,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   const [status, setStatus] = useState<string | null>('Loading sample model...')
   const [error, setError] = useState<string | null>(null)
 
+  // Lazy-initialize the underlying IfcViewerAPI once the div ref is ready
   const ensureViewer = useCallback(() => {
     if (viewerRef.current || !containerRef.current) {
       return viewerRef.current
@@ -38,6 +39,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     return viewer
   }, [])
 
+  // Helper to sequentially load models and clean up/abort overlapping requests
   const loadModel = useCallback(
     async (loader: Loader, message: string) => {
       const viewer = ensureViewer()
@@ -99,6 +101,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       return
     }
 
+    // Switch between default sample (URL) and uploaded file
     if (file) {
       loadModel((viewer) => viewer.IFC.loadIfc(file, true), 'Loading IFC file...')
     } else {
