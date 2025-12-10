@@ -12,6 +12,7 @@
   "dependencies": {
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
+    "camera-controls": "^1.38.2",
     "three": "^0.149.0",
     "web-ifc": "0.0.39",
     "web-ifc-viewer": "^1.0.218"
@@ -21,7 +22,7 @@
     "@types/node": "^24.6.0",
     "@types/react": "^19.1.16",
     "@types/react-dom": "^19.1.9",
-    "@types/three": "^0.149.0",
+    "@types/three": "^0.135.0",
     "@vitejs/plugin-react": "^5.0.4",
     "eslint": "^9.36.0",
     "eslint-plugin-react-hooks": "^5.2.0",
