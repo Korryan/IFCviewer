@@ -2,11 +2,13 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Plane, Raycaster, Vector3 } from 'three'
 import { IfcViewerAPI } from 'web-ifc-viewer'
 import type { OffsetVector, Point3D } from './ifcViewerTypes'
-import { useSelectionOffsets } from './hooks/useSelectionOffsets'
+import { useSelectionOffsets, CUSTOM_CUBE_MODEL_ID } from './hooks/useSelectionOffsets'
 import { useViewerSetup } from './hooks/useViewerSetup'
 import { CoordsOverlay } from './components/CoordsOverlay'
 import { InsertMenu } from './components/InsertMenu'
 import { PropertiesPanel } from './components/PropertiesPanel'
+import { ObjectTreePanel } from './components/ObjectTreePanel'
+import { buildIfcTree, useObjectTree } from './hooks/useObjectTree'
 
 type IfcViewerProps = {
   file?: File | null
@@ -39,6 +41,8 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   const dragPlaneRef = useRef<Plane | null>(null)
   const dragStartPointRef = useRef<Vector3 | null>(null)
   const dragStartOffsetRef = useRef<OffsetVector | null>(null)
+  const { tree, setIfcTree, resetTree, addCustomNode } = useObjectTree()
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
 
   const {
     selectedElement,
@@ -50,6 +54,9 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     applyOffsetToSelectedElement,
     handleFieldChange,
     handlePick,
+    selectById,
+    selectCustomCube,
+    clearIfcHighlight,
     moveSelectedTo,
     getSelectedWorldPosition,
     resetSelection,
@@ -79,8 +86,16 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
 
   const spawnUnitCube = useCallback(() => {
     const target = insertTargetCoords || hoverCoords || null
-    spawnCube(target, { focus: true })
-  }, [hoverCoords, insertTargetCoords, spawnCube])
+    const info = spawnCube(target, { focus: true })
+    if (!info) return
+    addCustomNode({
+      modelID: CUSTOM_CUBE_MODEL_ID,
+      expressID: info.expressID,
+      label: `Cube #${info.expressID}`,
+      type: 'CUBE',
+      parentId: selectedNodeId
+    })
+  }, [addCustomNode, hoverCoords, insertTargetCoords, selectedNodeId, spawnCube])
 
   const spawnUploadedModelAt = useCallback(
     async (uploadFile: File) => {
@@ -88,6 +103,96 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       await spawnUploadedModel(uploadFile, target, { focus: true })
     },
     [hoverCoords, insertTargetCoords, spawnUploadedModel]
+  )
+
+  const rebuildTreeForModel = useCallback(
+    async (modelID: number, loadToken: number) => {
+      const viewer = viewerRef.current
+      if (!viewer) return
+      try {
+        const spatial = await viewer.IFC.getSpatialStructure(modelID)
+        if (loadTokenRef.current !== loadToken) return
+        const tree = buildIfcTree(spatial, modelID)
+        if (loadTokenRef.current !== loadToken) return
+        setIfcTree(tree, modelID)
+        setSelectedNodeId(tree.roots[0] ?? null)
+      } catch (err) {
+        if (loadTokenRef.current !== loadToken) return
+        console.error('Failed to build IFC tree', err)
+        resetTree()
+        setSelectedNodeId(null)
+      }
+    },
+    [resetTree, setIfcTree]
+  )
+
+  const collectDescendantExpressIds = useCallback(
+    (nodeId: string) => {
+      const root = tree.nodes[nodeId]
+      if (!root) return []
+      const stack = [...root.children]
+      const ids = new Set<number>()
+      while (stack.length > 0) {
+        const currentId = stack.pop()
+        if (!currentId) continue
+        const node = tree.nodes[currentId]
+        if (!node) continue
+        if (node.nodeType === 'ifc' && node.expressID !== null) {
+          ids.add(node.expressID)
+        }
+        if (node.children.length > 0) {
+          stack.push(...node.children)
+        }
+      }
+      return Array.from(ids)
+    },
+    [tree.nodes]
+  )
+
+  const handleTreeSelect = useCallback(
+    async (nodeId: string) => {
+      setSelectedNodeId(nodeId)
+      const node = tree.nodes[nodeId]
+      if (!node) return
+      if (node.nodeType === 'ifc') {
+        if (node.expressID !== null) {
+          const descendantIds = collectDescendantExpressIds(nodeId)
+          await selectById(node.modelID, node.expressID, { highlightIds: descendantIds })
+          return
+        }
+        clearIfcHighlight()
+        return
+      }
+      clearIfcHighlight()
+      if (
+        node.nodeType === 'custom' &&
+        node.modelID === CUSTOM_CUBE_MODEL_ID &&
+        node.expressID !== null
+      ) {
+        selectCustomCube(node.expressID)
+      }
+    },
+    [clearIfcHighlight, collectDescendantExpressIds, selectById, selectCustomCube, tree.nodes]
+  )
+
+  const handleTreeAddChild = useCallback(
+    (nodeId: string) => {
+      const node = tree.nodes[nodeId]
+      if (!node) return
+      const target = hoverCoords ?? { x: 0, y: 0, z: 0 }
+      const info = spawnCube(target, { focus: true })
+      if (!info) return
+      const newNodeId = addCustomNode({
+        modelID: CUSTOM_CUBE_MODEL_ID,
+        expressID: info.expressID,
+        label: `Cube #${info.expressID}`,
+        type: 'CUBE',
+        parentId: nodeId
+      })
+      setSelectedNodeId(newNodeId)
+      selectCustomCube(info.expressID)
+    },
+    [addCustomNode, hoverCoords, selectCustomCube, spawnCube, tree.nodes]
   )
 
   useEffect(() => {
@@ -164,6 +269,19 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   }, [dragAxisLock, isDragging, moveSelectedTo, updateHoverCoords])
 
   useEffect(() => {
+    if (!selectedElement) {
+      setSelectedNodeId(null)
+      return
+    }
+    const match = Object.values(tree.nodes).find(
+      (node) =>
+        node.modelID === selectedElement.modelID &&
+        node.expressID === selectedElement.expressID
+    )
+    setSelectedNodeId(match?.id ?? null)
+  }, [selectedElement, tree.nodes])
+
+  useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key.toLowerCase() === 'a') {
         // Pop insert menu near cursor and cache the casted target point
@@ -200,13 +318,20 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
         const camera = viewer.context.getCamera()
         const normal = new Vector3()
         camera.getWorldDirection(normal)
-        const plane = new Plane().setFromNormalAndCoplanarPoint(normal, currentPos)
+        let startPoint = currentPos
+        if (selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) {
+          const hit = viewer.context.castRayIfc()
+          if (hit?.point) {
+            startPoint = hit.point
+          }
+        }
+        const plane = new Plane().setFromNormalAndCoplanarPoint(normal, startPoint)
         dragPlaneRef.current = plane
-        dragStartPointRef.current = currentPos.clone()
+        dragStartPointRef.current = startPoint.clone()
         dragStartOffsetRef.current = {
-          dx: currentPos.x,
-          dy: currentPos.y,
-          dz: currentPos.z
+          dx: offsetInputs.dx,
+          dy: offsetInputs.dy,
+          dz: offsetInputs.dz
         }
         setIsDragging(true)
         setDragAxisLock(null)
@@ -241,7 +366,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('pointerup', handlePointerUp)
     }
-  }, [getSelectedWorldPosition, hoverCoords, isDragging, selectedElement])
+  }, [getSelectedWorldPosition, hoverCoords, isDragging, offsetInputs, selectedElement])
 
   const loadModel = useCallback(
     async (loader: Loader, message: string) => {
@@ -253,6 +378,8 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       setStatus(message)
       setError(null)
       resetSelection()
+      resetTree()
+      setSelectedNodeId(null)
       if (lastModelIdRef.current !== null) {
         clearOffsetArtifacts(lastModelIdRef.current)
       }
@@ -277,6 +404,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
 
         if (model.modelID !== undefined) {
           lastModelIdRef.current = model.modelID
+          await rebuildTreeForModel(model.modelID, token)
         }
         setStatus(null)
       } catch (err) {
@@ -286,9 +414,10 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
         console.error('Failed to load IFC model', err)
         setError('Failed to load IFC model. Check the console for details.')
         setStatus(null)
+        resetTree()
       }
     },
-    [clearOffsetArtifacts, ensureViewer, resetSelection]
+    [clearOffsetArtifacts, ensureViewer, rebuildTreeForModel, resetSelection, resetTree]
   )
 
   useEffect(() => {
@@ -301,8 +430,10 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
         viewerRef.current = null
       }
       lastModelIdRef.current = null
+      resetTree()
+      setSelectedNodeId(null)
     }
-  }, [clearOffsetArtifacts, ensureViewer])
+  }, [clearOffsetArtifacts, ensureViewer, resetTree])
 
   useEffect(() => {
     if (!defaultModelUrl) {
@@ -346,16 +477,24 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
             {error && <div className="viewer-overlay viewer-overlay--error">{error}</div>}
           </div>
 
-          <PropertiesPanel
-            selectedElement={selectedElement}
-            isFetchingProperties={isFetchingProperties}
-            propertyError={propertyError}
-            offsetInputs={offsetInputs}
-            onOffsetChange={handleOffsetInputChange}
-            onApplyOffset={applyOffsetToSelectedElement}
-            propertyFields={propertyFields}
-            onFieldChange={handleFieldChange}
-          />
+          <div className="side-panel">
+            <ObjectTreePanel
+              tree={tree}
+              selectedNodeId={selectedNodeId}
+              onSelectNode={handleTreeSelect}
+              onAddChild={handleTreeAddChild}
+            />
+            <PropertiesPanel
+              selectedElement={selectedElement}
+              isFetchingProperties={isFetchingProperties}
+              propertyError={propertyError}
+              offsetInputs={offsetInputs}
+              onOffsetChange={handleOffsetInputChange}
+              onApplyOffset={applyOffsetToSelectedElement}
+              propertyFields={propertyFields}
+              onFieldChange={handleFieldChange}
+            />
+          </div>
         </div>
       </div>
       <input

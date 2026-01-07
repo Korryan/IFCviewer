@@ -21,3 +21,19 @@ export type Point3D = {
   y: number
   z: number
 }
+
+export type ObjectTreeNode = {
+  id: string
+  modelID: number
+  expressID: number | null
+  label: string
+  type: string
+  nodeType: 'ifc' | 'custom'
+  parentId: string | null
+  children: string[]
+}
+
+export type ObjectTree = {
+  nodes: Record<string, ObjectTreeNode>
+  roots: string[]
+}
