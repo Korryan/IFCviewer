@@ -16,10 +16,16 @@ const MOVED_SUBSET_PREFIX = 'moved-offset-'
 const zeroOffset: OffsetVector = { dx: 0, dy: 0, dz: 0 }
 const CUBE_BASE_COLOR = 0x4f46e5
 const CUBE_HIGHLIGHT_COLOR = 0xffb100
+const COORD_EPSILON = 1e-4
 export const CUSTOM_CUBE_MODEL_ID = -999
 
 type SpawnedCubeInfo = {
   expressID: number
+  position: Point3D
+}
+
+type SpawnedModelInfo = {
+  modelID: number
   position: Point3D
 }
 
@@ -40,6 +46,7 @@ type UseSelectionOffsetsResult = {
   ) => Promise<void>
   selectCustomCube: (expressID: number) => void
   clearIfcHighlight: () => void
+  getElementWorldPosition: (modelID: number, expressID: number) => Point3D | null
   moveSelectedTo: (targetOffset: OffsetVector) => void
   getSelectedWorldPosition: () => Vector3 | null
   resetSelection: () => void
@@ -49,7 +56,7 @@ type UseSelectionOffsetsResult = {
     file: File,
     target?: Point3D | null,
     options?: { focus?: boolean }
-  ) => Promise<void>
+  ) => Promise<SpawnedModelInfo | null>
 }
 
 export const useSelectionOffsets = (
@@ -61,6 +68,7 @@ export const useSelectionOffsets = (
   const movedSubsetsRef = useRef<Map<string, Mesh>>(new Map())
   const elementOffsetsRef = useRef<Map<string, OffsetVector>>(new Map())
   const expressIdCacheRef = useRef<Map<number, Set<number>>>(new Map())
+  const baseCentersRef = useRef<Map<string, Point3D>>(new Map())
   const cubeRegistryRef = useRef<Map<number, Mesh>>(new Map())
   const cubeIdCounterRef = useRef(1)
   const highlightedCubeRef = useRef<number | null>(null)
@@ -222,6 +230,79 @@ export const useSelectionOffsets = (
     [getExpressIdSet]
   )
 
+  const getBaseCenter = useCallback(
+    (modelID: number, expressID: number): Point3D | null => {
+      const key = getElementKey(modelID, expressID)
+      const cached = baseCentersRef.current.get(key)
+      if (cached) {
+        return cached
+      }
+      if (!hasRenderableExpressId(modelID, expressID)) {
+        return null
+      }
+      const viewer = viewerRef.current
+      if (!viewer) return null
+
+      const manager = viewer.IFC.loader.ifcManager
+      const scene = viewer.context.getScene()
+      const customId = `base-center-${modelID}-${expressID}`
+      const subset = manager.createSubset({
+        modelID,
+        ids: [expressID],
+        scene,
+        removePrevious: true,
+        customID: customId
+      })
+
+      if (!subset) {
+        return null
+      }
+
+      const cleanup = () => {
+        scene.remove(subset)
+        manager.removeSubset(modelID, undefined, customId)
+      }
+
+      subset.geometry.computeBoundingBox()
+      const bbox = subset.geometry.boundingBox
+      if (!bbox) {
+        cleanup()
+        return null
+      }
+
+      const center = new Vector3()
+      bbox.getCenter(center)
+      subset.updateMatrixWorld(true)
+      center.applyMatrix4(subset.matrixWorld)
+      cleanup()
+
+      const point = { x: center.x, y: center.y, z: center.z }
+      baseCentersRef.current.set(key, point)
+      return point
+    },
+    [getElementKey, hasRenderableExpressId, viewerRef]
+  )
+
+  const getElementWorldPosition = useCallback(
+    (modelID: number, expressID: number): Point3D | null => {
+      if (modelID === CUSTOM_CUBE_MODEL_ID) {
+        const cube = cubeRegistryRef.current.get(expressID)
+        return cube ? { x: cube.position.x, y: cube.position.y, z: cube.position.z } : null
+      }
+      const key = getElementKey(modelID, expressID)
+      const baseCenter = getBaseCenter(modelID, expressID)
+      if (!baseCenter) return null
+      const baseOffset = getModelBaseOffset(modelID)
+      const offset = elementOffsetsRef.current.get(key) ?? baseOffset
+      return {
+        x: baseCenter.x + (offset.dx - baseOffset.dx),
+        y: baseCenter.y + (offset.dy - baseOffset.dy),
+        z: baseCenter.z + (offset.dz - baseOffset.dz)
+      }
+    },
+    [getBaseCenter, getElementKey, getModelBaseOffset]
+  )
+
   const ensureBaseSubset = useCallback(
     (modelID: number) => {
       // Build one subset per model to hide originals and enable per-item offsets
@@ -308,7 +389,13 @@ export const useSelectionOffsets = (
           registerPickable(viewer, model, id)
         }
         expressIdCacheRef.current.delete(id)
+        Array.from(baseCentersRef.current.keys())
+          .filter((key) => key.startsWith(`${id}:`))
+          .forEach((key) => baseCentersRef.current.delete(key))
       })
+      if (typeof modelID !== 'number') {
+        baseCentersRef.current.clear()
+      }
     },
     [registerPickable, removePickable, viewerRef]
   )
@@ -436,8 +523,13 @@ export const useSelectionOffsets = (
           type: properties.type ?? properties.ifcClass
         })
         const key = getElementKey(modelID, expressID)
-        const fallbackOffset = getModelBaseOffset(modelID)
-        setOffsetInputs(elementOffsetsRef.current.get(key) ?? fallbackOffset)
+        const worldCenter = getElementWorldPosition(modelID, expressID)
+        if (worldCenter) {
+          setOffsetInputs({ dx: worldCenter.x, dy: worldCenter.y, dz: worldCenter.z })
+        } else {
+          const fallbackOffset = elementOffsetsRef.current.get(key) ?? getModelBaseOffset(modelID)
+          setOffsetInputs(fallbackOffset)
+        }
         setPropertyFields(buildPropertyFields(properties))
       } catch (err) {
         if (propertyRequestRef.current !== requestToken) {
@@ -453,7 +545,7 @@ export const useSelectionOffsets = (
         }
       }
     },
-    [buildPropertyFields, getElementKey, getModelBaseOffset, viewerRef]
+    [buildPropertyFields, getElementKey, getElementWorldPosition, getModelBaseOffset, viewerRef]
   )
 
   const handleFieldChange = useCallback((key: string, value: string) => {
@@ -501,6 +593,17 @@ export const useSelectionOffsets = (
         return
       }
 
+      const baseOffset = getModelBaseOffset(modelID)
+      const baseCenter = getBaseCenter(modelID, expressID)
+      if (!baseCenter) {
+        return
+      }
+      const resolvedOffset = {
+        dx: baseOffset.dx + (targetOffset.dx - baseCenter.x),
+        dy: baseOffset.dy + (targetOffset.dy - baseCenter.y),
+        dz: baseOffset.dz + (targetOffset.dz - baseCenter.z)
+      }
+
       const previous = movedSubsetsRef.current.get(key)
       if (previous) {
         scene.remove(previous)
@@ -517,7 +620,9 @@ export const useSelectionOffsets = (
       }
 
       const isZeroOffset =
-        targetOffset.dx === basePos.x && targetOffset.dy === basePos.y && targetOffset.dz === basePos.z
+        Math.abs(targetOffset.dx - baseCenter.x) < COORD_EPSILON &&
+        Math.abs(targetOffset.dy - baseCenter.y) < COORD_EPSILON &&
+        Math.abs(targetOffset.dz - baseCenter.z) < COORD_EPSILON
 
       if (isZeroOffset) {
         const restored = manager.createSubset({
@@ -554,17 +659,19 @@ export const useSelectionOffsets = (
         moved.scale.copy(baseScale)
       }
 
-      moved.position.set(targetOffset.dx, targetOffset.dy, targetOffset.dz)
+      moved.position.set(resolvedOffset.dx, resolvedOffset.dy, resolvedOffset.dz)
       moved.updateMatrix()
       moved.matrixAutoUpdate = false
 
       movedSubsetsRef.current.set(key, moved as Mesh)
-      elementOffsetsRef.current.set(key, targetOffset)
+      elementOffsetsRef.current.set(key, resolvedOffset)
       registerPickable(viewer, moved as Mesh)
     },
     [
       ensureBaseSubset,
+      getBaseCenter,
       getElementKey,
+      getModelBaseOffset,
       registerPickable,
       removePickable,
       selectedElement,
@@ -651,9 +758,10 @@ export const useSelectionOffsets = (
         }
         await fetchProperties(modelID, expressID)
         if (isRenderable) {
-          const key = getElementKey(modelID, expressID)
-          const offset = elementOffsetsRef.current.get(key) ?? getModelBaseOffset(modelID)
-          focusOnPoint({ x: offset.dx, y: offset.dy, z: offset.dz })
+          const center = getElementWorldPosition(modelID, expressID)
+          if (center) {
+            focusOnPoint(center)
+          }
         }
       } catch (err) {
         console.error('Failed to select IFC item by id', err)
@@ -662,8 +770,7 @@ export const useSelectionOffsets = (
     [
       fetchProperties,
       focusOnPoint,
-      getElementKey,
-      getModelBaseOffset,
+      getElementWorldPosition,
       hasRenderableExpressId,
       viewerRef
     ]
@@ -742,9 +849,13 @@ export const useSelectionOffsets = (
   )
 
   const spawnUploadedModel = useCallback(
-    async (file: File, target?: Point3D | null, options?: { focus?: boolean }) => {
+    async (
+      file: File,
+      target?: Point3D | null,
+      options?: { focus?: boolean }
+    ): Promise<SpawnedModelInfo | null> => {
       const viewer = viewerRef.current
-      if (!viewer) return
+      if (!viewer) return null
       try {
         const resolved = target || { x: 0, y: 0, z: 0 }
         const model = (await viewer.IFC.loadIfc(file, false)) as Mesh | undefined
@@ -754,10 +865,15 @@ export const useSelectionOffsets = (
           if (options?.focus) {
             focusOnPoint(resolved)
           }
+          const modelId = (model as { modelID?: number }).modelID
+          if (typeof modelId === 'number') {
+            return { modelID: modelId, position: resolved }
+          }
         }
       } catch (err) {
         console.error('Failed to load uploaded model', err)
       }
+      return null
     },
     [focusOnPoint, viewerRef]
   )
@@ -775,6 +891,7 @@ export const useSelectionOffsets = (
     selectById,
     selectCustomCube,
     clearIfcHighlight,
+    getElementWorldPosition,
     moveSelectedTo,
     getSelectedWorldPosition,
     resetSelection,

@@ -4,6 +4,7 @@ type InsertMenuProps = {
   onInsertCube: () => void
   onUploadClick: () => void
   onCancel: () => void
+  alignX?: 'left' | 'center'
 }
 
 // Small contextual menu for inserting cubes or uploading IFC near the cursor
@@ -46,21 +47,29 @@ const cancelBtn: React.CSSProperties = {
   cursor: 'pointer'
 }
 
-export const InsertMenu = ({ open, anchor, onInsertCube, onUploadClick, onCancel }: InsertMenuProps) => {
+export const InsertMenu = ({
+  open,
+  anchor,
+  onInsertCube,
+  onUploadClick,
+  onCancel,
+  alignX = 'left'
+}: InsertMenuProps) => {
   if (!open) return null
   return (
     <div
       style={{
         ...menuStyleBase,
         top: anchor ? anchor.y : 50,
-        left: anchor ? anchor.x : 8
+        left: anchor ? anchor.x : 8,
+        transform: alignX === 'center' ? 'translateX(-50%)' : 'none'
       }}
     >
       <button type="button" style={primaryBtn} onClick={onInsertCube}>
         Insert 1×1×1 cube
       </button>
       <button type="button" style={secondaryBtn} onClick={onUploadClick}>
-        Upload IFC model…
+        Upload IFC model
       </button>
       <button type="button" style={cancelBtn} onClick={onCancel}>
         Cancel

@@ -11,7 +11,7 @@ type PropertiesPanelProps = {
   onFieldChange: (key: string, value: string) => void
 }
 
-// Right-hand side inspector for offsets and editable IFC properties
+// Right-hand side inspector for coordinates and editable IFC properties
 export const PropertiesPanel = ({
   selectedElement,
   isFetchingProperties,
@@ -28,12 +28,13 @@ export const PropertiesPanel = ({
         <h2>Element properties</h2>
         {selectedElement && (
           <p className="properties-panel__meta">
-            #{selectedElement.expressID} {selectedElement.type ? `· ${selectedElement.type}` : ''}
+            #{selectedElement.expressID}
+            {selectedElement.type ? ` - ${selectedElement.type}` : ''}
           </p>
         )}
       </header>
       <div className="properties-panel__content">
-        {isFetchingProperties && <p className="properties-panel__status">Loading properties…</p>}
+        {isFetchingProperties && <p className="properties-panel__status">Loading properties...</p>}
         {propertyError && (
           <p className="properties-panel__status properties-panel__status--error">{propertyError}</p>
         )}
@@ -45,7 +46,10 @@ export const PropertiesPanel = ({
         {!isFetchingProperties && !propertyError && selectedElement && (
           <>
             <div className="offset-panel">
-              <h3>Offset</h3>
+              <div className="offset-panel__header">
+                <h3>Coordinates</h3>
+                <span className="offset-panel__units">world</span>
+              </div>
               <div className="offset-panel__grid">
                 {(['dx', 'dy', 'dz'] as Array<keyof OffsetVector>).map((axis) => (
                   <label key={axis} className="offset-panel__field">
@@ -67,10 +71,10 @@ export const PropertiesPanel = ({
                 ))}
               </div>
               <button type="button" className="offset-panel__apply" onClick={onApplyOffset}>
-                Apply offset
+                Apply coordinates
               </button>
               <p className="properties-panel__hint">
-                The IFC file stays untouched; only the rendered element moves.
+                Coordinates update while dragging; the IFC file stays untouched.
               </p>
             </div>
             <form className="properties-form">

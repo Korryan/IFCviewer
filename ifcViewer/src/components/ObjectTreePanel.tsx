@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ObjectTree } from '../ifcViewerTypes'
+import { InsertMenu } from './InsertMenu'
 
 type ObjectTreePanelProps = {
   tree: ObjectTree
   selectedNodeId: string | null
   onSelectNode: (nodeId: string) => void
-  onAddChild: (nodeId: string) => void
+  onAddCube: (nodeId: string) => void
+  onUploadModel: (nodeId: string) => void
 }
 
 type RenderNodeArgs = {
@@ -14,9 +16,9 @@ type RenderNodeArgs = {
   expanded: Set<string>
   pathSet: Set<string>
   toggle: (id: string) => void
+  onOpenMenu: (nodeId: string, anchor: { x: number; y: number }) => void
   selectedNodeId: string | null
   onSelectNode: (nodeId: string) => void
-  onAddChild: (nodeId: string) => void
   nodes: ObjectTree['nodes']
 }
 
@@ -28,9 +30,9 @@ const TreeNode = ({
   expanded,
   pathSet,
   toggle,
+  onOpenMenu,
   selectedNodeId,
   onSelectNode,
-  onAddChild,
   nodes
 }: RenderNodeArgs) => {
   const node = nodes[nodeId]
@@ -49,7 +51,7 @@ const TreeNode = ({
           onClick={() => (hasChildren ? toggle(nodeId) : onSelectNode(nodeId))}
           aria-label={hasChildren ? (isExpanded ? 'Collapse' : 'Expand') : 'Select'}
         >
-          {hasChildren ? (isExpanded ? '▾' : '▸') : '•'}
+          {hasChildren ? (isExpanded ? 'v' : '>') : '-'}
         </button>
         <button
           type="button"
@@ -70,7 +72,14 @@ const TreeNode = ({
         <button
           type="button"
           className="tree-node__add"
-          onClick={() => onAddChild(nodeId)}
+          onClick={(event) => {
+            event.stopPropagation()
+            const button = event.currentTarget as HTMLButtonElement
+            const row = button.closest('.tree-node__row') as HTMLDivElement | null
+            const rect = row?.getBoundingClientRect() ?? button.getBoundingClientRect()
+            const anchorX = row ? rect.left + rect.width / 2 : rect.left
+            onOpenMenu(nodeId, { x: anchorX, y: rect.bottom })
+          }}
           aria-label="Add child object"
           title="Add child object"
         >
@@ -87,9 +96,9 @@ const TreeNode = ({
               expanded={expanded}
               pathSet={pathSet}
               toggle={toggle}
+              onOpenMenu={onOpenMenu}
               selectedNodeId={selectedNodeId}
               onSelectNode={onSelectNode}
-              onAddChild={onAddChild}
               nodes={nodes}
             />
           ))}
@@ -103,16 +112,22 @@ export const ObjectTreePanel = ({
   tree,
   selectedNodeId,
   onSelectNode,
-  onAddChild
+  onAddCube,
+  onUploadModel
 }: ObjectTreePanelProps) => {
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [menuAnchor, setMenuAnchor] = useState<{ x: number; y: number } | null>(null)
+  const [menuNodeId, setMenuNodeId] = useState<string | null>(null)
   const contentRef = useRef<HTMLDivElement | null>(null)
+  const panelRef = useRef<HTMLElement | null>(null)
 
   // Auto-expand roots when tree changes
   useEffect(() => {
     const next = new Set<string>()
     tree.roots.forEach((rootId) => next.add(rootId))
     setExpanded(next)
+    setMenuAnchor(null)
+    setMenuNodeId(null)
   }, [tree.roots])
 
   const { selectionPath, selectionTrail } = useMemo(() => {
@@ -173,8 +188,28 @@ export const ObjectTreePanel = ({
 
   const hasContent = useMemo(() => tree.roots.length > 0, [tree.roots])
 
+  const handleOpenMenu = (nodeId: string, anchor: { x: number; y: number }) => {
+    const panel = panelRef.current
+    if (!panel) {
+      setMenuAnchor(null)
+      setMenuNodeId(null)
+      return
+    }
+    const panelRect = panel.getBoundingClientRect()
+    setMenuAnchor({
+      x: Math.max(0, anchor.x - panelRect.left),
+      y: Math.max(0, anchor.y - panelRect.top)
+    })
+    setMenuNodeId(nodeId)
+  }
+
+  const handleCloseMenu = () => {
+    setMenuAnchor(null)
+    setMenuNodeId(null)
+  }
+
   return (
-    <section className="tree-panel">
+    <section className="tree-panel" ref={panelRef}>
       <header className="tree-panel__header">
         <h2>Object tree</h2>
         <p>Hierarchy from IFC spatial structure.</p>
@@ -192,9 +227,9 @@ export const ObjectTreePanel = ({
               expanded={expanded}
               pathSet={selectionPath}
               toggle={toggle}
+              onOpenMenu={handleOpenMenu}
               selectedNodeId={selectedNodeId}
               onSelectNode={onSelectNode}
-              onAddChild={onAddChild}
               nodes={tree.nodes}
             />
           ))
@@ -202,6 +237,24 @@ export const ObjectTreePanel = ({
           <p className="tree-panel__status">Load an IFC model to see its hierarchy.</p>
         )}
       </div>
+      <InsertMenu
+        open={Boolean(menuAnchor && menuNodeId)}
+        anchor={menuAnchor}
+        alignX="center"
+        onInsertCube={() => {
+          if (menuNodeId) {
+            onAddCube(menuNodeId)
+          }
+          handleCloseMenu()
+        }}
+        onUploadClick={() => {
+          if (menuNodeId) {
+            onUploadModel(menuNodeId)
+          }
+          handleCloseMenu()
+        }}
+        onCancel={handleCloseMenu}
+      />
     </section>
   )
 }

@@ -25,6 +25,8 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const viewerRef = useRef<IfcViewerAPI | null>(null)
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
+  const treeUploadInputRef = useRef<HTMLInputElement | null>(null)
+  const pendingTreeUploadRef = useRef<string | null>(null)
   // Pointer bookkeeping so the insert menu knows where to appear
   const lastPointerPosRef = useRef<{ x: number; y: number }>({ x: 16, y: 16 })
   // Remember the last loaded IFC model id for cleanup
@@ -57,6 +59,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     selectById,
     selectCustomCube,
     clearIfcHighlight,
+    getElementWorldPosition,
     moveSelectedTo,
     getSelectedWorldPosition,
     resetSelection,
@@ -99,11 +102,26 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
 
   const spawnUploadedModelAt = useCallback(
     async (uploadFile: File) => {
-    const target = insertTargetCoords || hoverCoords || { x: 0, y: 0, z: 0 }
+      const target = insertTargetCoords || hoverCoords || { x: 0, y: 0, z: 0 }
       await spawnUploadedModel(uploadFile, target, { focus: true })
     },
     [hoverCoords, insertTargetCoords, spawnUploadedModel]
   )
+
+  const getModelCenter = useCallback((modelID: number): Point3D | null => {
+    const viewer = viewerRef.current
+    if (!viewer) return null
+    const model = viewer.IFC.loader.ifcManager.state?.models?.[modelID]?.mesh
+    if (!model || !('geometry' in model)) return null
+    model.geometry.computeBoundingBox()
+    const bbox = model.geometry.boundingBox
+    if (!bbox) return null
+    const center = new Vector3()
+    bbox.getCenter(center)
+    model.updateMatrixWorld(true)
+    center.applyMatrix4(model.matrixWorld)
+    return { x: center.x, y: center.y, z: center.z }
+  }, [])
 
   const rebuildTreeForModel = useCallback(
     async (modelID: number, loadToken: number) => {
@@ -149,6 +167,80 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     [tree.nodes]
   )
 
+  const resolveNodePosition = useCallback(
+    (nodeId: string): Point3D | null => {
+      const node = tree.nodes[nodeId]
+      if (!node) return null
+      if (node.expressID !== null) {
+        const direct = getElementWorldPosition(node.modelID, node.expressID)
+        if (direct) return direct
+      }
+      if (node.nodeType === 'ifc') {
+        const descendantIds = collectDescendantExpressIds(nodeId)
+        for (const id of descendantIds) {
+          const pos = getElementWorldPosition(node.modelID, id)
+          if (pos) return pos
+        }
+      }
+      return null
+    },
+    [collectDescendantExpressIds, getElementWorldPosition, tree.nodes]
+  )
+
+  const nudgeTowardCamera = useCallback((point: Point3D): Point3D => {
+    const viewer = viewerRef.current
+    if (!viewer) return point
+    const camera = viewer.context.getCamera()
+    const target = new Vector3(point.x, point.y, point.z)
+    const cameraPos = new Vector3()
+    camera.getWorldPosition(cameraPos)
+    const direction = cameraPos.clone().sub(target)
+    const distance = direction.length()
+    if (distance === 0) return point
+    direction.normalize()
+    const offset = Math.min(0.6, distance * 0.25)
+    target.add(direction.multiplyScalar(offset))
+    return { x: target.x, y: target.y, z: target.z }
+  }, [])
+
+  const resolveTreeInsertTarget = useCallback(
+    (nodeId: string): Point3D => {
+      const node = tree.nodes[nodeId]
+      let target = resolveNodePosition(nodeId)
+      if (target && node?.nodeType === 'ifc') {
+        target = nudgeTowardCamera(target)
+      }
+      if (!target && node) {
+        target = getModelCenter(node.modelID)
+      }
+      if (!target) {
+        const selectedPos = getSelectedWorldPosition()
+        if (selectedPos) {
+          target = { x: selectedPos.x, y: selectedPos.y, z: selectedPos.z }
+        }
+      }
+      return target ?? hoverCoords ?? { x: 0, y: 0, z: 0 }
+    },
+    [
+      getModelCenter,
+      getSelectedWorldPosition,
+      hoverCoords,
+      nudgeTowardCamera,
+      resolveNodePosition,
+      tree.nodes
+    ]
+  )
+
+  const getCoordinatesInsertTarget = useCallback(
+    (nodeId: string): Point3D => {
+      if (selectedElement) {
+        return { x: offsetInputs.dx, y: offsetInputs.dy, z: offsetInputs.dz }
+      }
+      return resolveTreeInsertTarget(nodeId)
+    },
+    [offsetInputs, resolveTreeInsertTarget, selectedElement]
+  )
+
   const handleTreeSelect = useCallback(
     async (nodeId: string) => {
       setSelectedNodeId(nodeId)
@@ -175,12 +267,10 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     [clearIfcHighlight, collectDescendantExpressIds, selectById, selectCustomCube, tree.nodes]
   )
 
-  const handleTreeAddChild = useCallback(
+  const handleTreeAddCube = useCallback(
     (nodeId: string) => {
-      const node = tree.nodes[nodeId]
-      if (!node) return
-      const target = hoverCoords ?? { x: 0, y: 0, z: 0 }
-      const info = spawnCube(target, { focus: true })
+      const resolvedTarget = getCoordinatesInsertTarget(nodeId)
+      const info = spawnCube(resolvedTarget, { focus: true })
       if (!info) return
       const newNodeId = addCustomNode({
         modelID: CUSTOM_CUBE_MODEL_ID,
@@ -192,8 +282,13 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       setSelectedNodeId(newNodeId)
       selectCustomCube(info.expressID)
     },
-    [addCustomNode, hoverCoords, selectCustomCube, spawnCube, tree.nodes]
+    [addCustomNode, getCoordinatesInsertTarget, selectCustomCube, spawnCube]
   )
+
+  const handleTreeUploadModel = useCallback((nodeId: string) => {
+    pendingTreeUploadRef.current = nodeId
+    treeUploadInputRef.current?.click()
+  }, [])
 
   useEffect(() => {
     const container = containerRef.current
@@ -482,7 +577,8 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
               tree={tree}
               selectedNodeId={selectedNodeId}
               onSelectNode={handleTreeSelect}
-              onAddChild={handleTreeAddChild}
+              onAddCube={handleTreeAddCube}
+              onUploadModel={handleTreeUploadModel}
             />
             <PropertiesPanel
               selectedElement={selectedElement}
@@ -511,6 +607,32 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
           setIsInsertMenuOpen(false)
           setInsertMenuAnchor(null)
           setInsertTargetCoords(null)
+        }}
+      />
+      <input
+        type="file"
+        accept=".ifc"
+        style={{ display: 'none' }}
+        ref={treeUploadInputRef}
+        onChange={async (event) => {
+          const inputFile = event.target.files?.[0]
+          const parentId = pendingTreeUploadRef.current
+          if (inputFile && parentId) {
+            const resolvedTarget = getCoordinatesInsertTarget(parentId)
+            const info = await spawnUploadedModel(inputFile, resolvedTarget, { focus: true })
+            if (info) {
+              const newNodeId = addCustomNode({
+                modelID: info.modelID,
+                expressID: null,
+                label: inputFile.name,
+                type: 'IFC',
+                parentId
+              })
+              setSelectedNodeId(newNodeId)
+            }
+          }
+          pendingTreeUploadRef.current = null
+          event.target.value = ''
         }}
       />
     </>
