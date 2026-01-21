@@ -22,6 +22,23 @@ export type Point3D = {
   z: number
 }
 
+export type MetadataEntry = {
+  ifcId: number
+  type?: string
+  custom?: Record<string, string>
+  position?: Point3D
+  updatedAt?: string
+}
+
+export type FurnitureItem = {
+  id: string
+  model: string
+  position: Point3D
+  rotation?: Point3D
+  scale?: Point3D
+  updatedAt?: string
+}
+
 export type ObjectTreeNode = {
   id: string
   modelID: number

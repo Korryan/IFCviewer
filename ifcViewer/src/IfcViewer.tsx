@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plane, Raycaster, Vector3 } from 'three'
 import { IfcViewerAPI } from 'web-ifc-viewer'
-import type { OffsetVector, Point3D } from './ifcViewerTypes'
+import type { FurnitureItem, MetadataEntry, OffsetVector, Point3D } from './ifcViewerTypes'
 import { useSelectionOffsets, CUSTOM_CUBE_MODEL_ID } from './hooks/useSelectionOffsets'
 import { useViewerSetup } from './hooks/useViewerSetup'
 import { CoordsOverlay } from './components/CoordsOverlay'
@@ -18,6 +18,59 @@ type IfcViewerProps = {
 type Loader = (viewer: IfcViewerAPI) => Promise<any>
 
 const wasmRootPath = '/ifc/'
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8080/projects/1'
+const CUBE_ITEM_PREFIX = 'cube-'
+const POSITION_EPSILON = 1e-4
+
+const fetchJson = async <T,>(url: string, options?: RequestInit): Promise<T> => {
+  const response = await fetch(url, options)
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status}`)
+  }
+  return response.json() as Promise<T>
+}
+
+const loadMetadata = () => fetchJson<MetadataEntry[]>(`${API_BASE}/metadata`)
+const saveMetadata = (items: MetadataEntry[]) =>
+  fetchJson<MetadataEntry[]>(`${API_BASE}/metadata`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(items)
+  })
+const loadFurniture = () => fetchJson<FurnitureItem[]>(`${API_BASE}/furniture`)
+const saveFurniture = (items: FurnitureItem[]) =>
+  fetchJson<FurnitureItem[]>(`${API_BASE}/furniture`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(items)
+  })
+
+const parseCubeId = (id: string): number | null => {
+  if (!id.startsWith(CUBE_ITEM_PREFIX)) return null
+  const parsed = Number(id.slice(CUBE_ITEM_PREFIX.length))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+const sanitizeMetadataEntries = (entries: MetadataEntry[]): MetadataEntry[] => {
+  return entries
+    .filter((entry) => entry && typeof entry.ifcId === 'number')
+    .map((entry) => {
+      const sanitizedCustom: Record<string, string> = {}
+      if (entry.custom) {
+        Object.entries(entry.custom).forEach(([key, value]) => {
+          if (typeof value === 'string') {
+            sanitizedCustom[key] = value
+          }
+        })
+      }
+      const resolvedType = typeof entry.type === 'string' ? entry.type : undefined
+      return {
+        ...entry,
+        type: resolvedType,
+        custom: sanitizedCustom
+      }
+    })
+}
 
 // Top-level viewer wiring together scene setup, selection hook, and UI overlays
 const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
@@ -45,6 +98,12 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   const dragStartOffsetRef = useRef<OffsetVector | null>(null)
   const { tree, setIfcTree, resetTree, addCustomNode } = useObjectTree()
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  const [metadataEntries, setMetadataEntries] = useState<MetadataEntry[]>([])
+  const [furnitureEntries, setFurnitureEntries] = useState<FurnitureItem[]>([])
+  const [isHydrated, setIsHydrated] = useState(false)
+  const furnitureRestoredRef = useRef(false)
+  const offsetsRestoredRef = useRef<number | null>(null)
+  const [activeModelId, setActiveModelId] = useState<number | null>(null)
 
   const {
     selectedElement,
@@ -65,10 +124,230 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     resetSelection,
     clearOffsetArtifacts,
     spawnCube,
-    spawnUploadedModel
+    spawnUploadedModel,
+    applyIfcElementOffset
   } = useSelectionOffsets(viewerRef)
 
   const ensureViewer = useViewerSetup(containerRef, viewerRef, wasmRootPath)
+  const metadataMap = useMemo(
+    () => new Map(metadataEntries.map((entry) => [entry.ifcId, entry])),
+    [metadataEntries]
+  )
+
+  const upsertMetadataEntry = useCallback(
+    (ifcId: number, updater: (current: MetadataEntry) => MetadataEntry) => {
+      setMetadataEntries((prev) => {
+        const index = prev.findIndex((entry) => entry.ifcId === ifcId)
+        const existing: MetadataEntry =
+          index >= 0
+            ? prev[index]
+            : {
+                ifcId,
+                custom: {}
+              }
+        const nextEntry = updater(existing)
+        if (index === -1) {
+          return [...prev, nextEntry]
+        }
+        const next = prev.slice()
+        next[index] = nextEntry
+        return next
+      })
+    },
+    []
+  )
+
+  const upsertFurnitureItem = useCallback((nextItem: FurnitureItem) => {
+    setFurnitureEntries((prev) => {
+      const index = prev.findIndex((item) => item.id === nextItem.id)
+      if (index === -1) {
+        return [...prev, nextItem]
+      }
+      const next = prev.slice()
+      next[index] = {
+        ...prev[index],
+        ...nextItem,
+        position: nextItem.position,
+        rotation: nextItem.rotation ?? prev[index].rotation,
+        scale: nextItem.scale ?? prev[index].scale
+      }
+      return next
+    })
+  }, [])
+
+  const registerCubeFurniture = useCallback(
+    (info: { expressID: number; position: Point3D }) => {
+      upsertFurnitureItem({
+        id: `${CUBE_ITEM_PREFIX}${info.expressID}`,
+        model: 'cube',
+        position: info.position,
+        rotation: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 }
+      })
+    },
+    [upsertFurnitureItem]
+  )
+
+  const syncSelectedCubePosition = useCallback(() => {
+    if (!selectedElement || selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) return
+    const pos = getSelectedWorldPosition()
+    if (!pos) return
+    upsertFurnitureItem({
+      id: `${CUBE_ITEM_PREFIX}${selectedElement.expressID}`,
+      model: 'cube',
+      position: { x: pos.x, y: pos.y, z: pos.z },
+      rotation: { x: 0, y: 0, z: 0 },
+      scale: { x: 1, y: 1, z: 1 }
+    })
+  }, [getSelectedWorldPosition, selectedElement, upsertFurnitureItem])
+
+  const syncSelectedIfcPosition = useCallback(() => {
+    if (!selectedElement || selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) return
+    const resolved =
+      getElementWorldPosition(selectedElement.modelID, selectedElement.expressID) ?? {
+        x: offsetInputs.dx,
+        y: offsetInputs.dy,
+        z: offsetInputs.dz
+      }
+    upsertMetadataEntry(selectedElement.expressID, (existing) => {
+      const resolvedType =
+        typeof selectedElement.type === 'string' ? selectedElement.type : existing.type
+      const prev = existing.position
+      const isSamePosition =
+        prev &&
+        Math.abs(prev.x - resolved.x) < POSITION_EPSILON &&
+        Math.abs(prev.y - resolved.y) < POSITION_EPSILON &&
+        Math.abs(prev.z - resolved.z) < POSITION_EPSILON
+      if (isSamePosition && existing.type === resolvedType) {
+        return existing
+      }
+      return {
+        ...existing,
+        ifcId: selectedElement.expressID,
+        type: resolvedType,
+        position: resolved,
+        custom: existing.custom ?? {}
+      }
+    })
+  }, [getElementWorldPosition, offsetInputs, selectedElement, upsertMetadataEntry])
+
+  const handlePropertyFieldChange = useCallback(
+    (key: string, value: string) => {
+      handleFieldChange(key, value)
+      if (!selectedElement || selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
+        return
+      }
+      upsertMetadataEntry(selectedElement.expressID, (existing) => {
+        const resolvedType =
+          typeof selectedElement.type === 'string' ? selectedElement.type : existing.type
+        return {
+          ...existing,
+          ifcId: selectedElement.expressID,
+          type: resolvedType,
+          custom: {
+            ...(existing.custom ?? {}),
+            [key]: value
+          }
+        }
+      })
+    },
+    [handleFieldChange, selectedElement, upsertMetadataEntry]
+  )
+
+  const applyOffsetAndPersist = useCallback(() => {
+    applyOffsetToSelectedElement()
+    syncSelectedCubePosition()
+    syncSelectedIfcPosition()
+  }, [applyOffsetToSelectedElement, syncSelectedCubePosition, syncSelectedIfcPosition])
+
+  useEffect(() => {
+    let cancelled = false
+    const loadProjectData = async () => {
+      try {
+        const [metadata, furniture] = await Promise.all([loadMetadata(), loadFurniture()])
+        if (cancelled) return
+        const safeMetadata = sanitizeMetadataEntries(Array.isArray(metadata) ? metadata : [])
+        setMetadataEntries(safeMetadata)
+        setFurnitureEntries(Array.isArray(furniture) ? furniture : [])
+      } catch (err) {
+        console.error('Failed to load project data', err)
+      } finally {
+        if (!cancelled) {
+          setIsHydrated(true)
+        }
+      }
+    }
+    loadProjectData()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isHydrated) return
+    const timer = window.setTimeout(() => {
+      void saveMetadata(metadataEntries).catch((err) => {
+        console.error('Failed to save metadata', err)
+      })
+    }, 500)
+    return () => window.clearTimeout(timer)
+  }, [isHydrated, metadataEntries])
+
+  useEffect(() => {
+    if (!isHydrated) return
+    const timer = window.setTimeout(() => {
+      void saveFurniture(furnitureEntries).catch((err) => {
+        console.error('Failed to save furniture', err)
+      })
+    }, 500)
+    return () => window.clearTimeout(timer)
+  }, [furnitureEntries, isHydrated])
+
+  useEffect(() => {
+    if (!selectedElement || propertyFields.length === 0) return
+    const stored = metadataMap.get(selectedElement.expressID)
+    if (!stored?.custom) return
+    propertyFields.forEach((field) => {
+      const customValue = stored.custom?.[field.key]
+      if (typeof customValue === 'string' && customValue !== field.value) {
+        handleFieldChange(field.key, customValue)
+      }
+    })
+  }, [handleFieldChange, metadataMap, propertyFields, selectedElement])
+
+  useEffect(() => {
+    if (!isHydrated || furnitureRestoredRef.current) return
+    const viewer = ensureViewer()
+    if (!viewer) return
+    furnitureEntries.forEach((item) => {
+      if (item.model !== 'cube') return
+      const cubeId = parseCubeId(item.id)
+      if (!cubeId) return
+      const info = spawnCube(item.position, { id: cubeId, focus: false })
+      if (!info) return
+      addCustomNode({
+        modelID: CUSTOM_CUBE_MODEL_ID,
+        expressID: info.expressID,
+        label: `Cube #${info.expressID}`,
+        type: 'CUBE'
+      })
+    })
+    furnitureRestoredRef.current = true
+  }, [addCustomNode, ensureViewer, furnitureEntries, isHydrated, spawnCube])
+
+  useEffect(() => {
+    if (!isHydrated || activeModelId === null) return
+    if (offsetsRestoredRef.current === activeModelId) return
+    metadataEntries.forEach((entry) => {
+      if (!entry.position) return
+      applyIfcElementOffset(activeModelId, entry.ifcId, {
+        dx: entry.position.x,
+        dy: entry.position.y,
+        dz: entry.position.z
+      })
+    })
+    offsetsRestoredRef.current = activeModelId
+  }, [activeModelId, applyIfcElementOffset, isHydrated, metadataEntries])
 
   const updateHoverCoords = useCallback(() => {
     // Cast a ray to show world coordinates under cursor
@@ -91,6 +370,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     const target = insertTargetCoords || hoverCoords || null
     const info = spawnCube(target, { focus: true })
     if (!info) return
+    registerCubeFurniture(info)
     addCustomNode({
       modelID: CUSTOM_CUBE_MODEL_ID,
       expressID: info.expressID,
@@ -98,7 +378,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       type: 'CUBE',
       parentId: selectedNodeId
     })
-  }, [addCustomNode, hoverCoords, insertTargetCoords, selectedNodeId, spawnCube])
+  }, [addCustomNode, hoverCoords, insertTargetCoords, registerCubeFurniture, selectedNodeId, spawnCube])
 
   const spawnUploadedModelAt = useCallback(
     async (uploadFile: File) => {
@@ -272,6 +552,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       const resolvedTarget = getCoordinatesInsertTarget(nodeId)
       const info = spawnCube(resolvedTarget, { focus: true })
       if (!info) return
+      registerCubeFurniture(info)
       const newNodeId = addCustomNode({
         modelID: CUSTOM_CUBE_MODEL_ID,
         expressID: info.expressID,
@@ -282,7 +563,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       setSelectedNodeId(newNodeId)
       selectCustomCube(info.expressID)
     },
-    [addCustomNode, getCoordinatesInsertTarget, selectCustomCube, spawnCube]
+    [addCustomNode, getCoordinatesInsertTarget, registerCubeFurniture, selectCustomCube, spawnCube]
   )
 
   const handleTreeUploadModel = useCallback((nodeId: string) => {
@@ -448,6 +729,11 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     }
 
     const handlePointerUp = () => {
+      const wasDragging = isDragging || dragStartOffsetRef.current !== null
+      if (wasDragging) {
+        syncSelectedCubePosition()
+        syncSelectedIfcPosition()
+      }
       setIsDragging(false)
       setDragAxisLock(null)
       dragPlaneRef.current = null
@@ -461,7 +747,15 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       window.removeEventListener('keydown', handleKeyDown)
       window.removeEventListener('pointerup', handlePointerUp)
     }
-  }, [getSelectedWorldPosition, hoverCoords, isDragging, offsetInputs, selectedElement])
+  }, [
+    getSelectedWorldPosition,
+    hoverCoords,
+    isDragging,
+    offsetInputs,
+    selectedElement,
+    syncSelectedCubePosition,
+    syncSelectedIfcPosition
+  ])
 
   const loadModel = useCallback(
     async (loader: Loader, message: string) => {
@@ -475,6 +769,8 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       resetSelection()
       resetTree()
       setSelectedNodeId(null)
+      setActiveModelId(null)
+      offsetsRestoredRef.current = null
       if (lastModelIdRef.current !== null) {
         clearOffsetArtifacts(lastModelIdRef.current)
       }
@@ -500,6 +796,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
         if (model.modelID !== undefined) {
           lastModelIdRef.current = model.modelID
           await rebuildTreeForModel(model.modelID, token)
+          setActiveModelId(model.modelID)
         }
         setStatus(null)
       } catch (err) {
@@ -527,6 +824,8 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       lastModelIdRef.current = null
       resetTree()
       setSelectedNodeId(null)
+      setActiveModelId(null)
+      offsetsRestoredRef.current = null
     }
   }, [clearOffsetArtifacts, ensureViewer, resetTree])
 
@@ -586,9 +885,9 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
               propertyError={propertyError}
               offsetInputs={offsetInputs}
               onOffsetChange={handleOffsetInputChange}
-              onApplyOffset={applyOffsetToSelectedElement}
+              onApplyOffset={applyOffsetAndPersist}
               propertyFields={propertyFields}
-              onFieldChange={handleFieldChange}
+              onFieldChange={handlePropertyFieldChange}
             />
           </div>
         </div>

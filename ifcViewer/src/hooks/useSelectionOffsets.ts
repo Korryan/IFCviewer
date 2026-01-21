@@ -24,6 +24,11 @@ type SpawnedCubeInfo = {
   position: Point3D
 }
 
+type SpawnCubeOptions = {
+  focus?: boolean
+  id?: number
+}
+
 type SpawnedModelInfo = {
   modelID: number
   position: Point3D
@@ -48,10 +53,11 @@ type UseSelectionOffsetsResult = {
   clearIfcHighlight: () => void
   getElementWorldPosition: (modelID: number, expressID: number) => Point3D | null
   moveSelectedTo: (targetOffset: OffsetVector) => void
+  applyIfcElementOffset: (modelID: number, expressID: number, targetOffset: OffsetVector) => void
   getSelectedWorldPosition: () => Vector3 | null
   resetSelection: () => void
   clearOffsetArtifacts: (modelID?: number | null) => void
-  spawnCube: (target?: Point3D | null, options?: { focus?: boolean }) => SpawnedCubeInfo | null
+  spawnCube: (target?: Point3D | null, options?: SpawnCubeOptions) => SpawnedCubeInfo | null
   spawnUploadedModel: (
     file: File,
     target?: Point3D | null,
@@ -270,8 +276,11 @@ export const useSelectionOffsets = (
         return null
       }
 
-      const center = new Vector3()
-      bbox.getCenter(center)
+      const center = new Vector3(
+        (bbox.min.x + bbox.max.x) / 2,
+        bbox.min.y,
+        (bbox.min.z + bbox.max.z) / 2
+      )
       subset.updateMatrixWorld(true)
       center.applyMatrix4(subset.matrixWorld)
       cleanup()
@@ -517,10 +526,18 @@ export const useSelectionOffsets = (
           return
         }
 
+        const resolvedType =
+          typeof properties.ifcClass === 'string'
+            ? properties.ifcClass
+            : typeof properties.type === 'string'
+              ? properties.type
+              : typeof properties.type === 'number'
+                ? String(properties.type)
+                : undefined
         setSelectedElement({
           modelID,
           expressID,
-          type: properties.type ?? properties.ifcClass
+          type: resolvedType
         })
         const key = getElementKey(modelID, expressID)
         const worldCenter = getElementWorldPosition(modelID, expressID)
@@ -559,33 +576,16 @@ export const useSelectionOffsets = (
     }))
   }, [])
 
-  const moveSelectedTo = useCallback(
-    (targetOffset: OffsetVector) => {
-      // Move cubes directly or rebuild IFC subsets so the element appears at the new offset
+  const applyIfcElementOffset = useCallback(
+    (modelID: number, expressID: number, targetOffset: OffsetVector) => {
       const viewer = viewerRef.current
-      if (!viewer || !selectedElement) return
-
-      setOffsetInputs(targetOffset)
-
-      if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
-        const key = `cube:${selectedElement.expressID}`
-        const cube = cubeRegistryRef.current.get(selectedElement.expressID)
-        if (cube) {
-          cube.position.set(targetOffset.dx, targetOffset.dy, targetOffset.dz)
-          cube.updateMatrix()
-          cube.matrixAutoUpdate = false
-          elementOffsetsRef.current.set(key, targetOffset)
-        }
-        return
-      }
-
-      if (!hasRenderableExpressId(selectedElement.modelID, selectedElement.expressID)) {
+      if (!viewer) return
+      if (!hasRenderableExpressId(modelID, expressID)) {
         return
       }
 
       const manager = viewer.IFC.loader.ifcManager
       const scene = viewer.context.getScene()
-      const { modelID, expressID } = selectedElement
       const key = getElementKey(modelID, expressID)
 
       const baseSubset = ensureBaseSubset(modelID)
@@ -672,8 +672,37 @@ export const useSelectionOffsets = (
       getBaseCenter,
       getElementKey,
       getModelBaseOffset,
+      hasRenderableExpressId,
       registerPickable,
       removePickable,
+      viewerRef
+    ]
+  )
+
+  const moveSelectedTo = useCallback(
+    (targetOffset: OffsetVector) => {
+      // Move cubes directly or rebuild IFC subsets so the element appears at the new offset
+      const viewer = viewerRef.current
+      if (!viewer || !selectedElement) return
+
+      setOffsetInputs(targetOffset)
+
+      if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
+        const key = `cube:${selectedElement.expressID}`
+        const cube = cubeRegistryRef.current.get(selectedElement.expressID)
+        if (cube) {
+          cube.position.set(targetOffset.dx, targetOffset.dy, targetOffset.dz)
+          cube.updateMatrix()
+          cube.matrixAutoUpdate = false
+          elementOffsetsRef.current.set(key, targetOffset)
+        }
+        return
+      }
+
+      applyIfcElementOffset(selectedElement.modelID, selectedElement.expressID, targetOffset)
+    },
+    [
+      applyIfcElementOffset,
       selectedElement,
       viewerRef
     ]
@@ -803,7 +832,7 @@ export const useSelectionOffsets = (
   }, [viewerRef])
 
   const spawnCubeAt = useCallback(
-    (target?: Point3D | null): SpawnedCubeInfo | null => {
+    (target?: Point3D | null, id?: number): SpawnedCubeInfo | null => {
       const viewer = viewerRef.current
       if (!viewer) return null
 
@@ -819,7 +848,21 @@ export const useSelectionOffsets = (
       const position = target ?? { x: 0, y: 0, z: 0 }
       cube.position.set(position.x, position.y, position.z)
 
-      const cubeExpressId = cubeIdCounterRef.current++
+      const resolvedId =
+        typeof id === 'number' && Number.isFinite(id) && id > 0
+          ? Math.trunc(id)
+          : cubeIdCounterRef.current++
+      if (resolvedId >= cubeIdCounterRef.current) {
+        cubeIdCounterRef.current = resolvedId + 1
+      }
+      const existing = cubeRegistryRef.current.get(resolvedId)
+      if (existing) {
+        existing.position.set(position.x, position.y, position.z)
+        existing.updateMatrix()
+        existing.matrixAutoUpdate = false
+        return { expressID: resolvedId, position }
+      }
+      const cubeExpressId = resolvedId
       const positionAttr = cube.geometry.getAttribute('position')
       const vertexCount = positionAttr ? positionAttr.count : 0
       const ids = new Float32Array(vertexCount)
@@ -837,9 +880,9 @@ export const useSelectionOffsets = (
   )
 
   const spawnCube = useCallback(
-    (target?: Point3D | null, options?: { focus?: boolean }): SpawnedCubeInfo | null => {
+    (target?: Point3D | null, options?: SpawnCubeOptions): SpawnedCubeInfo | null => {
       // Convenience wrapper that also focuses the camera if requested
-      const info = spawnCubeAt(target)
+      const info = spawnCubeAt(target, options?.id)
       if (options?.focus && info) {
         focusOnPoint(info.position)
       }
@@ -897,6 +940,7 @@ export const useSelectionOffsets = (
     resetSelection,
     clearOffsetArtifacts,
     spawnCube,
-    spawnUploadedModel
+    spawnUploadedModel,
+    applyIfcElementOffset
   }
 }

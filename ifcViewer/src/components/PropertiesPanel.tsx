@@ -74,7 +74,7 @@ export const PropertiesPanel = ({
                 Apply coordinates
               </button>
               <p className="properties-panel__hint">
-                Coordinates update while dragging; the IFC file stays untouched.
+                Coordinates show the bottom center of the element bounding box.
               </p>
             </div>
             <form className="properties-form">
@@ -107,7 +107,7 @@ export const PropertiesPanel = ({
               )}
             </form>
             <p className="properties-panel__hint">
-              Changes are stored only in memory for now; backend sync will come later.
+              Changes are saved to the local REST API (file-backed).
             </p>
           </>
         )}

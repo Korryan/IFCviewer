@@ -139,7 +139,7 @@ export const ObjectTreePanel = ({
     let current: string | null = selectedNodeId
     while (current) {
       ids.push(current)
-      const node = tree.nodes[current]
+      const node: ObjectTree['nodes'][string] | undefined = tree.nodes[current]
       if (!node || !node.parentId) break
       current = node.parentId
     }
@@ -147,7 +147,7 @@ export const ObjectTreePanel = ({
       .slice()
       .reverse()
       .forEach((id) => {
-        const node = tree.nodes[id]
+        const node: ObjectTree['nodes'][string] | undefined = tree.nodes[id]
         if (node) {
           trail.push(node.label)
         }
