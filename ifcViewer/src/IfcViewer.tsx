@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plane, Raycaster, Vector3 } from 'three'
 import { IfcViewerAPI } from 'web-ifc-viewer'
-import type { FurnitureItem, MetadataEntry, OffsetVector, Point3D } from './ifcViewerTypes'
+import { IFCDOOR, IFCSPACE, IFCWALL } from 'web-ifc'
+import type { FurnitureItem, HistoryEntry, MetadataEntry, OffsetVector, Point3D } from './ifcViewerTypes'
 import { useSelectionOffsets, CUSTOM_CUBE_MODEL_ID } from './hooks/useSelectionOffsets'
 import { useViewerSetup } from './hooks/useViewerSetup'
 import { CoordsOverlay } from './components/CoordsOverlay'
@@ -21,6 +22,11 @@ const wasmRootPath = '/ifc/'
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8080/projects/1'
 const CUBE_ITEM_PREFIX = 'cube-'
 const POSITION_EPSILON = 1e-4
+const IFC_VIEW_FILTERS = [
+  { key: 'space', label: 'IfcSpace', typeId: IFCSPACE },
+  { key: 'wall', label: 'IfcWall', typeId: IFCWALL },
+  { key: 'door', label: 'IfcDoor', typeId: IFCDOOR }
+] as const
 
 const fetchJson = async <T,>(url: string, options?: RequestInit): Promise<T> => {
   const response = await fetch(url, options)
@@ -40,6 +46,13 @@ const saveMetadata = (items: MetadataEntry[]) =>
 const loadFurniture = () => fetchJson<FurnitureItem[]>(`${API_BASE}/furniture`)
 const saveFurniture = (items: FurnitureItem[]) =>
   fetchJson<FurnitureItem[]>(`${API_BASE}/furniture`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(items)
+  })
+const loadHistory = () => fetchJson<HistoryEntry[]>(`${API_BASE}/history`)
+const saveHistory = (items: HistoryEntry[]) =>
+  fetchJson<HistoryEntry[]>(`${API_BASE}/history`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(items)
@@ -72,6 +85,15 @@ const sanitizeMetadataEntries = (entries: MetadataEntry[]): MetadataEntry[] => {
     })
 }
 
+const sanitizeHistoryEntries = (entries: HistoryEntry[]): HistoryEntry[] => {
+  return entries
+    .filter((entry) => entry && typeof entry.ifcId === 'number' && typeof entry.label === 'string')
+    .map((entry) => ({
+      ...entry,
+      timestamp: typeof entry.timestamp === 'string' ? entry.timestamp : new Date().toISOString()
+    }))
+}
+
 // Top-level viewer wiring together scene setup, selection hook, and UI overlays
 const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   // Scene / viewer refs
@@ -80,6 +102,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
   const treeUploadInputRef = useRef<HTMLInputElement | null>(null)
   const pendingTreeUploadRef = useRef<string | null>(null)
+  const filterCacheRef = useRef<Map<number, Map<number, number[]>>>(new Map())
   // Pointer bookkeeping so the insert menu knows where to appear
   const lastPointerPosRef = useRef<{ x: number; y: number }>({ x: 16, y: 16 })
   // Remember the last loaded IFC model id for cleanup
@@ -100,6 +123,10 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [metadataEntries, setMetadataEntries] = useState<MetadataEntry[]>([])
   const [furnitureEntries, setFurnitureEntries] = useState<FurnitureItem[]>([])
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([])
+  const [viewFilters, setViewFilters] = useState<Record<string, boolean>>(() => {
+    return Object.fromEntries(IFC_VIEW_FILTERS.map((filter) => [filter.key, false]))
+  })
   const [isHydrated, setIsHydrated] = useState(false)
   const furnitureRestoredRef = useRef(false)
   const offsetsRestoredRef = useRef<number | null>(null)
@@ -125,7 +152,8 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     clearOffsetArtifacts,
     spawnCube,
     spawnUploadedModel,
-    applyIfcElementOffset
+    applyIfcElementOffset,
+    applyVisibilityFilter
   } = useSelectionOffsets(viewerRef)
 
   const ensureViewer = useViewerSetup(containerRef, viewerRef, wasmRootPath)
@@ -133,6 +161,89 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     () => new Map(metadataEntries.map((entry) => [entry.ifcId, entry])),
     [metadataEntries]
   )
+  const activeFilterDefs = useMemo(
+    () => IFC_VIEW_FILTERS.filter((filter) => viewFilters[filter.key]),
+    [viewFilters]
+  )
+  const filterOptions = useMemo(
+    () =>
+      IFC_VIEW_FILTERS.map((filter) => ({
+        key: filter.key,
+        label: filter.label,
+        active: Boolean(viewFilters[filter.key])
+      })),
+    [viewFilters]
+  )
+
+  const toggleFilter = useCallback((key: string) => {
+    setViewFilters((prev) => ({
+      ...prev,
+      [key]: !prev[key]
+    }))
+  }, [])
+
+  const resetFilters = useCallback(() => {
+    setViewFilters(Object.fromEntries(IFC_VIEW_FILTERS.map((filter) => [filter.key, false])))
+  }, [])
+
+  const getTypeIds = useCallback(
+    async (modelID: number, typeId: number): Promise<number[]> => {
+      const viewer = viewerRef.current
+      if (!viewer) return []
+      let modelCache = filterCacheRef.current.get(modelID)
+      if (!modelCache) {
+        modelCache = new Map()
+        filterCacheRef.current.set(modelID, modelCache)
+      }
+      const cached = modelCache.get(typeId)
+      if (cached) return cached
+      const manager = viewer.IFC.loader.ifcManager as {
+        getAllItemsOfType?: (id: number, type: number, verbose?: boolean) => number[] | Promise<number[]>
+      }
+      const getter = manager.getAllItemsOfType ?? viewer.IFC.getAllItemsOfType?.bind(viewer.IFC)
+      if (!getter) {
+        return []
+      }
+      const ids = await Promise.resolve(getter(modelID, typeId, false))
+      const safeIds = Array.isArray(ids) ? ids.filter((value) => typeof value === 'number') : []
+      modelCache.set(typeId, safeIds)
+      return safeIds
+    },
+    []
+  )
+
+  const pushHistoryEntry = useCallback((ifcId: number, label: string, timestamp?: string) => {
+    const nextTimestamp = timestamp ?? new Date().toISOString()
+    setHistoryEntries((prev) => {
+      const remaining = prev.filter((entry) => entry.ifcId !== ifcId)
+      const existing = prev.filter((entry) => entry.ifcId === ifcId)
+      const next = [{ ifcId, label, timestamp: nextTimestamp }, ...existing].slice(0, 12)
+      return [...next, ...remaining]
+    })
+  }, [])
+
+  const selectedElementName = useMemo(() => {
+    if (!selectedElement) return null
+    const nameField = propertyFields.find(
+      (field) => field.label.toLowerCase() === 'name' || field.key.toLowerCase() === 'name'
+    )
+    return nameField?.value || null
+  }, [propertyFields, selectedElement])
+
+  const selectedHistoryEntries = useMemo(() => {
+    if (!selectedElement || selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
+      return []
+    }
+    const stored = metadataMap.get(selectedElement.expressID)
+    const items = historyEntries.filter((entry) => entry.ifcId === selectedElement.expressID)
+    if (stored?.updatedAt) {
+      return [
+        { label: 'Saved to backend', timestamp: stored.updatedAt },
+        ...items
+      ]
+    }
+    return items
+  }, [historyEntries, metadataMap, selectedElement])
 
   const upsertMetadataEntry = useCallback(
     (ifcId: number, updater: (current: MetadataEntry) => MetadataEntry) => {
@@ -233,9 +344,14 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
 
   const handlePropertyFieldChange = useCallback(
     (key: string, value: string) => {
+      const previousValue = propertyFields.find((field) => field.key === key)?.value
+      const fieldLabel = propertyFields.find((field) => field.key === key)?.label ?? key
       handleFieldChange(key, value)
       if (!selectedElement || selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
         return
+      }
+      if (previousValue !== value) {
+        pushHistoryEntry(selectedElement.expressID, `Field "${fieldLabel}" updated`)
       }
       upsertMetadataEntry(selectedElement.expressID, (existing) => {
         const resolvedType =
@@ -251,24 +367,39 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
         }
       })
     },
-    [handleFieldChange, selectedElement, upsertMetadataEntry]
+    [handleFieldChange, propertyFields, pushHistoryEntry, selectedElement, upsertMetadataEntry]
   )
 
   const applyOffsetAndPersist = useCallback(() => {
     applyOffsetToSelectedElement()
     syncSelectedCubePosition()
     syncSelectedIfcPosition()
-  }, [applyOffsetToSelectedElement, syncSelectedCubePosition, syncSelectedIfcPosition])
+    if (selectedElement && selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) {
+      pushHistoryEntry(selectedElement.expressID, 'Position updated')
+    }
+  }, [
+    applyOffsetToSelectedElement,
+    pushHistoryEntry,
+    selectedElement,
+    syncSelectedCubePosition,
+    syncSelectedIfcPosition
+  ])
 
   useEffect(() => {
     let cancelled = false
     const loadProjectData = async () => {
       try {
-        const [metadata, furniture] = await Promise.all([loadMetadata(), loadFurniture()])
+        const [metadata, furniture, history] = await Promise.all([
+          loadMetadata(),
+          loadFurniture(),
+          loadHistory()
+        ])
         if (cancelled) return
         const safeMetadata = sanitizeMetadataEntries(Array.isArray(metadata) ? metadata : [])
         setMetadataEntries(safeMetadata)
         setFurnitureEntries(Array.isArray(furniture) ? furniture : [])
+        const safeHistory = sanitizeHistoryEntries(Array.isArray(history) ? history : [])
+        setHistoryEntries(safeHistory)
       } catch (err) {
         console.error('Failed to load project data', err)
       } finally {
@@ -302,6 +433,16 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     }, 500)
     return () => window.clearTimeout(timer)
   }, [furnitureEntries, isHydrated])
+
+  useEffect(() => {
+    if (!isHydrated) return
+    const timer = window.setTimeout(() => {
+      void saveHistory(historyEntries).catch((err) => {
+        console.error('Failed to save history', err)
+      })
+    }, 500)
+    return () => window.clearTimeout(timer)
+  }, [historyEntries, isHydrated])
 
   useEffect(() => {
     if (!selectedElement || propertyFields.length === 0) return
@@ -348,6 +489,29 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     })
     offsetsRestoredRef.current = activeModelId
   }, [activeModelId, applyIfcElementOffset, isHydrated, metadataEntries])
+
+  useEffect(() => {
+    if (activeModelId === null) {
+      return
+    }
+    let cancelled = false
+    const applyFilters = async () => {
+      if (activeFilterDefs.length === 0) {
+        applyVisibilityFilter(activeModelId, null)
+        return
+      }
+      const buckets = await Promise.all(
+        activeFilterDefs.map((filter) => getTypeIds(activeModelId, filter.typeId))
+      )
+      if (cancelled) return
+      const merged = Array.from(new Set(buckets.flat()))
+      applyVisibilityFilter(activeModelId, merged)
+    }
+    void applyFilters()
+    return () => {
+      cancelled = true
+    }
+  }, [activeFilterDefs, activeModelId, applyVisibilityFilter, getTypeIds])
 
   const updateHoverCoords = useCallback(() => {
     // Cast a ray to show world coordinates under cursor
@@ -549,7 +713,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
 
   const handleTreeAddCube = useCallback(
     (nodeId: string) => {
-      const resolvedTarget = getCoordinatesInsertTarget(nodeId)
+      const resolvedTarget = { x: 0, y: 0, z: 0 }
       const info = spawnCube(resolvedTarget, { focus: true })
       if (!info) return
       registerCubeFurniture(info)
@@ -563,7 +727,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       setSelectedNodeId(newNodeId)
       selectCustomCube(info.expressID)
     },
-    [addCustomNode, getCoordinatesInsertTarget, registerCubeFurniture, selectCustomCube, spawnCube]
+    [addCustomNode, registerCubeFurniture, selectCustomCube, spawnCube]
   )
 
   const handleTreeUploadModel = useCallback((nodeId: string) => {
@@ -733,6 +897,9 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       if (wasDragging) {
         syncSelectedCubePosition()
         syncSelectedIfcPosition()
+        if (selectedElement && selectedElement.modelID !== CUSTOM_CUBE_MODEL_ID) {
+          pushHistoryEntry(selectedElement.expressID, 'Position updated')
+        }
       }
       setIsDragging(false)
       setDragAxisLock(null)
@@ -753,6 +920,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     isDragging,
     offsetInputs,
     selectedElement,
+    pushHistoryEntry,
     syncSelectedCubePosition,
     syncSelectedIfcPosition
   ])
@@ -770,6 +938,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       resetTree()
       setSelectedNodeId(null)
       setActiveModelId(null)
+      filterCacheRef.current.clear()
       offsetsRestoredRef.current = null
       if (lastModelIdRef.current !== null) {
         clearOffsetArtifacts(lastModelIdRef.current)
@@ -878,6 +1047,11 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
               onSelectNode={handleTreeSelect}
               onAddCube={handleTreeAddCube}
               onUploadModel={handleTreeUploadModel}
+              filters={filterOptions}
+              filtersDisabled={activeModelId === null}
+              hasActiveFilters={activeFilterDefs.length > 0}
+              onToggleFilter={toggleFilter}
+              onResetFilters={resetFilters}
             />
             <PropertiesPanel
               selectedElement={selectedElement}
@@ -886,6 +1060,8 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
               offsetInputs={offsetInputs}
               onOffsetChange={handleOffsetInputChange}
               onApplyOffset={applyOffsetAndPersist}
+              elementName={selectedElementName}
+              historyEntries={selectedHistoryEntries}
               propertyFields={propertyFields}
               onFieldChange={handlePropertyFieldChange}
             />
@@ -917,7 +1093,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
           const inputFile = event.target.files?.[0]
           const parentId = pendingTreeUploadRef.current
           if (inputFile && parentId) {
-            const resolvedTarget = getCoordinatesInsertTarget(parentId)
+            const resolvedTarget = { x: 0, y: 0, z: 0 }
             const info = await spawnUploadedModel(inputFile, resolvedTarget, { focus: true })
             if (info) {
               const newNodeId = addCustomNode({

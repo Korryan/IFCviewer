@@ -1,6 +1,7 @@
 package cz.ifc.backend.controller;
 
 import cz.ifc.backend.model.FurnitureItem;
+import cz.ifc.backend.model.HistoryEntry;
 import cz.ifc.backend.model.MetadataEntry;
 import cz.ifc.backend.storage.FileStorageService;
 import java.util.List;
@@ -49,5 +50,19 @@ public class ProjectDataController {
       @PathVariable String projectId,
       @RequestBody(required = false) List<FurnitureItem> items) {
     return storageService.writeFurniture(projectId, items);
+  }
+
+  // Load full history list for a project.
+  @GetMapping("/history")
+  public List<HistoryEntry> getHistory(@PathVariable String projectId) {
+    return storageService.readHistory(projectId);
+  }
+
+  // Replace history list for a project (simple PUT for the prototype).
+  @PutMapping(path = "/history", consumes = MediaType.APPLICATION_JSON_VALUE)
+  public List<HistoryEntry> putHistory(
+      @PathVariable String projectId,
+      @RequestBody(required = false) List<HistoryEntry> items) {
+    return storageService.writeHistory(projectId, items);
   }
 }

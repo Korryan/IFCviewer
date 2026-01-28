@@ -13,10 +13,12 @@ import type { OffsetVector, Point3D, PropertyField, SelectedElement } from '../i
 
 const BASE_SUBSET_ID = 'base-offset-subset'
 const MOVED_SUBSET_PREFIX = 'moved-offset-'
+const FILTER_SUBSET_PREFIX = 'filter-subset-'
 const zeroOffset: OffsetVector = { dx: 0, dy: 0, dz: 0 }
 const CUBE_BASE_COLOR = 0x4f46e5
 const CUBE_HIGHLIGHT_COLOR = 0xffb100
 const COORD_EPSILON = 1e-4
+const ENABLE_MANUAL_FOCUS_ON_SELECT = false
 export const CUSTOM_CUBE_MODEL_ID = -999
 
 type SpawnedCubeInfo = {
@@ -63,6 +65,7 @@ type UseSelectionOffsetsResult = {
     target?: Point3D | null,
     options?: { focus?: boolean }
   ) => Promise<SpawnedModelInfo | null>
+  applyVisibilityFilter: (modelID: number, visibleIds: number[] | null) => void
 }
 
 export const useSelectionOffsets = (
@@ -75,9 +78,12 @@ export const useSelectionOffsets = (
   const elementOffsetsRef = useRef<Map<string, OffsetVector>>(new Map())
   const expressIdCacheRef = useRef<Map<number, Set<number>>>(new Map())
   const baseCentersRef = useRef<Map<string, Point3D>>(new Map())
+  const filterSubsetsRef = useRef<Map<number, Mesh>>(new Map())
+  const filterIdsRef = useRef<Map<number, Set<number> | null>>(new Map())
   const cubeRegistryRef = useRef<Map<number, Mesh>>(new Map())
   const cubeIdCounterRef = useRef(1)
   const highlightedCubeRef = useRef<number | null>(null)
+  const focusOffsetRef = useRef<Point3D | null>(null)
 
   const [selectedElement, setSelectedElement] = useState<SelectedElement | null>(null)
   const [offsetInputs, setOffsetInputs] = useState<OffsetVector>(zeroOffset)
@@ -95,6 +101,17 @@ export const useSelectionOffsets = (
     },
     [viewerRef]
   )
+
+  const getCameraFocusPoint = useCallback((): Point3D | null => {
+    const viewer = viewerRef.current
+    const controls = viewer?.context.ifcCamera.cameraControls as
+      | { getTarget?: (out: Vector3) => void }
+      | undefined
+    if (!controls?.getTarget) return null
+    const target = new Vector3()
+    controls.getTarget(target)
+    return { x: target.x, y: target.y, z: target.z }
+  }, [viewerRef])
 
   const setCubeHighlight = useCallback((expressID: number | null) => {
     // Toggle cube color to indicate selection
@@ -137,11 +154,16 @@ export const useSelectionOffsets = (
     setPropertyError(null)
     setIsFetchingProperties(false)
     setCubeHighlight(null)
+    focusOffsetRef.current = null
     viewerRef.current?.IFC.selector.unpickIfcItems()
   }, [setCubeHighlight])
 
   const getElementKey = useCallback((modelID: number, expressID: number) => {
     return `${modelID}:${expressID}`
+  }, [])
+
+  const getFilterSubsetId = useCallback((modelID: number) => {
+    return `${FILTER_SUBSET_PREFIX}${modelID}`
   }, [])
 
   const getModelBaseOffset = useCallback(
@@ -370,6 +392,14 @@ export const useSelectionOffsets = (
       const idsToClear = typeof modelID === 'number' ? [modelID] : derivedIds
 
       idsToClear.forEach((id) => {
+        const filterSubset = filterSubsetsRef.current.get(id)
+        if (filterSubset) {
+          scene.remove(filterSubset)
+          removePickable(viewer, filterSubset)
+          manager.removeSubset(id, undefined, getFilterSubsetId(id))
+          filterSubsetsRef.current.delete(id)
+          filterIdsRef.current.delete(id)
+        }
         const movedKeys = Array.from(movedSubsetsRef.current.keys()).filter((key) =>
           key.startsWith(`${id}:`)
         )
@@ -406,7 +436,115 @@ export const useSelectionOffsets = (
         baseCentersRef.current.clear()
       }
     },
-    [registerPickable, removePickable, viewerRef]
+    [getFilterSubsetId, registerPickable, removePickable, viewerRef]
+  )
+
+  const updateVisibilityForModel = useCallback(
+    (modelID: number, allowedIds: Set<number> | null) => {
+      const viewer = viewerRef.current
+      if (!viewer) return
+      const manager = viewer.IFC.loader.ifcManager
+      const scene = viewer.context.getScene()
+
+      const baseSubset = ensureBaseSubset(modelID)
+      const modelMesh = manager.state?.models?.[modelID]?.mesh
+      const filterSubset = filterSubsetsRef.current.get(modelID)
+
+      if (!allowedIds) {
+        if (filterSubset) {
+          scene.remove(filterSubset)
+          removePickable(viewer, filterSubset)
+          manager.removeSubset(modelID, undefined, getFilterSubsetId(modelID))
+          filterSubsetsRef.current.delete(modelID)
+        }
+        if (baseSubset) {
+          baseSubset.visible = true
+          registerPickable(viewer, baseSubset, modelID)
+        } else if (modelMesh) {
+          modelMesh.visible = true
+        }
+        movedSubsetsRef.current.forEach((subset, key) => {
+          if (key.startsWith(`${modelID}:`)) {
+            subset.visible = true
+          }
+        })
+        return
+      }
+
+      if (allowedIds.size === 0) {
+        if (filterSubset) {
+          scene.remove(filterSubset)
+          removePickable(viewer, filterSubset)
+          manager.removeSubset(modelID, undefined, getFilterSubsetId(modelID))
+          filterSubsetsRef.current.delete(modelID)
+        }
+        if (baseSubset) {
+          baseSubset.visible = false
+        } else if (modelMesh) {
+          modelMesh.visible = false
+        }
+        movedSubsetsRef.current.forEach((subset, key) => {
+          if (key.startsWith(`${modelID}:`)) {
+            subset.visible = false
+          }
+        })
+        return
+      }
+
+      if (baseSubset) {
+        baseSubset.visible = false
+      } else if (modelMesh) {
+        modelMesh.visible = false
+      }
+
+      const movedIds = new Set<number>()
+      movedSubsetsRef.current.forEach((subset, key) => {
+        if (!key.startsWith(`${modelID}:`)) return
+        const expressId = Number(key.split(':')[1])
+        if (Number.isFinite(expressId)) {
+          movedIds.add(expressId)
+          subset.visible = allowedIds.has(expressId)
+        }
+      })
+
+      const idsToShow = Array.from(allowedIds).filter((id) => !movedIds.has(id))
+      if (idsToShow.length === 0) {
+        if (filterSubset) {
+          scene.remove(filterSubset)
+          removePickable(viewer, filterSubset)
+          manager.removeSubset(modelID, undefined, getFilterSubsetId(modelID))
+          filterSubsetsRef.current.delete(modelID)
+        }
+        return
+      }
+
+      const subset = manager.createSubset({
+        modelID,
+        ids: idsToShow,
+        scene,
+        removePrevious: true,
+        customID: getFilterSubsetId(modelID)
+      })
+      if (subset) {
+        if (baseSubset) {
+          subset.matrix.copy(baseSubset.matrix)
+          subset.matrixAutoUpdate = false
+        }
+        filterSubsetsRef.current.set(modelID, subset as Mesh)
+        registerPickable(viewer, subset as Mesh, modelID)
+      }
+    },
+    [ensureBaseSubset, getFilterSubsetId, registerPickable, removePickable, viewerRef]
+  )
+
+  const applyVisibilityFilter = useCallback(
+    (modelID: number, visibleIds: number[] | null) => {
+      const allowed =
+        visibleIds === null ? null : new Set(visibleIds.filter(Number.isFinite))
+      filterIdsRef.current.set(modelID, allowed)
+      updateVisibilityForModel(modelID, allowed)
+    },
+    [updateVisibilityForModel]
   )
 
   const normalizeIfcValue = useCallback((rawValue: any): string => {
@@ -508,7 +646,7 @@ export const useSelectionOffsets = (
   )
 
   const fetchProperties = useCallback(
-    async (modelID: number, expressID: number) => {
+    async (modelID: number, expressID: number, focusPoint?: Point3D | null) => {
       // Guard against race conditions by tokenizing property requests
       const viewer = viewerRef.current
       if (!viewer) return
@@ -540,9 +678,19 @@ export const useSelectionOffsets = (
           type: resolvedType
         })
         const key = getElementKey(modelID, expressID)
-        const worldCenter = getElementWorldPosition(modelID, expressID)
-        if (worldCenter) {
-          setOffsetInputs({ dx: worldCenter.x, dy: worldCenter.y, dz: worldCenter.z })
+        const resolvedFocus = focusPoint ?? getElementWorldPosition(modelID, expressID)
+        const currentCenter = getElementWorldPosition(modelID, expressID)
+        if (resolvedFocus && currentCenter) {
+          focusOffsetRef.current = {
+            x: resolvedFocus.x - currentCenter.x,
+            y: resolvedFocus.y - currentCenter.y,
+            z: resolvedFocus.z - currentCenter.z
+          }
+        } else {
+          focusOffsetRef.current = null
+        }
+        if (resolvedFocus) {
+          setOffsetInputs({ dx: resolvedFocus.x, dy: resolvedFocus.y, dz: resolvedFocus.z })
         } else {
           const fallbackOffset = elementOffsetsRef.current.get(key) ?? getModelBaseOffset(modelID)
           setOffsetInputs(fallbackOffset)
@@ -637,6 +785,10 @@ export const useSelectionOffsets = (
           restored.matrixAutoUpdate = false
         }
         elementOffsetsRef.current.delete(key)
+        const activeFilter = filterIdsRef.current.get(modelID)
+        if (activeFilter && activeFilter.has(expressID)) {
+          updateVisibilityForModel(modelID, activeFilter)
+        }
         return
       }
 
@@ -666,6 +818,10 @@ export const useSelectionOffsets = (
       movedSubsetsRef.current.set(key, moved as Mesh)
       elementOffsetsRef.current.set(key, resolvedOffset)
       registerPickable(viewer, moved as Mesh)
+      const activeFilter = filterIdsRef.current.get(modelID)
+      if (activeFilter) {
+        updateVisibilityForModel(modelID, activeFilter)
+      }
     },
     [
       ensureBaseSubset,
@@ -675,6 +831,7 @@ export const useSelectionOffsets = (
       hasRenderableExpressId,
       registerPickable,
       removePickable,
+      updateVisibilityForModel,
       viewerRef
     ]
   )
@@ -688,6 +845,7 @@ export const useSelectionOffsets = (
       setOffsetInputs(targetOffset)
 
       if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
+        focusOffsetRef.current = null
         const key = `cube:${selectedElement.expressID}`
         const cube = cubeRegistryRef.current.get(selectedElement.expressID)
         if (cube) {
@@ -699,7 +857,16 @@ export const useSelectionOffsets = (
         return
       }
 
-      applyIfcElementOffset(selectedElement.modelID, selectedElement.expressID, targetOffset)
+      const focusOffset = focusOffsetRef.current
+      const adjustedTarget = focusOffset
+        ? {
+            dx: targetOffset.dx - focusOffset.x,
+            dy: targetOffset.dy - focusOffset.y,
+            dz: targetOffset.dz - focusOffset.z
+          }
+        : targetOffset
+
+      applyIfcElementOffset(selectedElement.modelID, selectedElement.expressID, adjustedTarget)
     },
     [
       applyIfcElementOffset,
@@ -754,12 +921,13 @@ export const useSelectionOffsets = (
         return
       }
 
-      await fetchProperties(picked.modelID, picked.id)
+      const focusPoint = getCameraFocusPoint()
+      await fetchProperties(picked.modelID, picked.id, focusPoint)
     } catch (err) {
       console.error('Failed to pick IFC item', err)
       resetSelection()
     }
-  }, [fetchProperties, resetSelection, setCubeHighlight, viewerRef])
+  }, [fetchProperties, getCameraFocusPoint, resetSelection, setCubeHighlight, viewerRef])
 
   const selectById = useCallback(
     async (
@@ -785,10 +953,11 @@ export const useSelectionOffsets = (
         } else {
           viewer.IFC.selector.unpickIfcItems()
         }
-        await fetchProperties(modelID, expressID)
+        const focusPoint = isRenderable ? getCameraFocusPoint() : null
+        await fetchProperties(modelID, expressID, focusPoint)
         if (isRenderable) {
           const center = getElementWorldPosition(modelID, expressID)
-          if (center) {
+          if (ENABLE_MANUAL_FOCUS_ON_SELECT && center) {
             focusOnPoint(center)
           }
         }
@@ -798,6 +967,7 @@ export const useSelectionOffsets = (
     },
     [
       fetchProperties,
+      getCameraFocusPoint,
       focusOnPoint,
       getElementWorldPosition,
       hasRenderableExpressId,
@@ -941,6 +1111,7 @@ export const useSelectionOffsets = (
     clearOffsetArtifacts,
     spawnCube,
     spawnUploadedModel,
-    applyIfcElementOffset
+    applyIfcElementOffset,
+    applyVisibilityFilter
   }
 }

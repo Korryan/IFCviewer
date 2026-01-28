@@ -1,4 +1,4 @@
-import type { OffsetVector, PropertyField, SelectedElement } from '../ifcViewerTypes'
+import type { HistoryEntry, OffsetVector, PropertyField, SelectedElement } from '../ifcViewerTypes'
 
 type PropertiesPanelProps = {
   selectedElement: SelectedElement | null
@@ -7,6 +7,8 @@ type PropertiesPanelProps = {
   offsetInputs: OffsetVector
   onOffsetChange: (axis: keyof OffsetVector, value: number) => void
   onApplyOffset: () => void
+  elementName?: string | null
+  historyEntries?: HistoryEntry[]
   propertyFields: PropertyField[]
   onFieldChange: (key: string, value: string) => void
 }
@@ -19,19 +21,22 @@ export const PropertiesPanel = ({
   offsetInputs,
   onOffsetChange,
   onApplyOffset,
+  elementName,
+  historyEntries = [],
   propertyFields,
   onFieldChange
 }: PropertiesPanelProps) => {
   return (
     <aside className="properties-panel">
       <header className="properties-panel__header">
-        <h2>Element properties</h2>
+        <h2>{elementName || 'Element properties'}</h2>
         {selectedElement && (
           <p className="properties-panel__meta">
             #{selectedElement.expressID}
             {selectedElement.type ? ` - ${selectedElement.type}` : ''}
           </p>
         )}
+        {elementName && <p className="properties-panel__meta">Element properties</p>}
       </header>
       <div className="properties-panel__content">
         {isFetchingProperties && <p className="properties-panel__status">Loading properties...</p>}
@@ -106,6 +111,25 @@ export const PropertiesPanel = ({
                 </p>
               )}
             </form>
+            <div className="history-panel">
+              <div className="history-panel__header">
+                <h3>History</h3>
+              </div>
+              {historyEntries.length > 0 ? (
+                <ul className="history-panel__list">
+                  {historyEntries.map((entry, index) => (
+                    <li key={`${entry.timestamp}-${index}`} className="history-panel__item">
+                      <span className="history-panel__label">{entry.label}</span>
+                      <span className="history-panel__time">
+                        {new Date(entry.timestamp).toLocaleString()}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="properties-panel__status">No history yet.</p>
+              )}
+            </div>
             <p className="properties-panel__hint">
               Changes are saved to the local REST API (file-backed).
             </p>

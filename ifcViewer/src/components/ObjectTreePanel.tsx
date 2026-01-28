@@ -8,6 +8,11 @@ type ObjectTreePanelProps = {
   onSelectNode: (nodeId: string) => void
   onAddCube: (nodeId: string) => void
   onUploadModel: (nodeId: string) => void
+  filters?: { key: string; label: string; active: boolean }[]
+  hasActiveFilters?: boolean
+  filtersDisabled?: boolean
+  onToggleFilter?: (key: string) => void
+  onResetFilters?: () => void
 }
 
 type RenderNodeArgs = {
@@ -113,11 +118,17 @@ export const ObjectTreePanel = ({
   selectedNodeId,
   onSelectNode,
   onAddCube,
-  onUploadModel
+  onUploadModel,
+  filters = [],
+  hasActiveFilters = false,
+  filtersDisabled = false,
+  onToggleFilter,
+  onResetFilters
 }: ObjectTreePanelProps) => {
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [menuAnchor, setMenuAnchor] = useState<{ x: number; y: number } | null>(null)
   const [menuNodeId, setMenuNodeId] = useState<string | null>(null)
+  const [filtersOpen, setFiltersOpen] = useState(false)
   const contentRef = useRef<HTMLDivElement | null>(null)
   const panelRef = useRef<HTMLElement | null>(null)
 
@@ -129,6 +140,27 @@ export const ObjectTreePanel = ({
     setMenuAnchor(null)
     setMenuNodeId(null)
   }, [tree.roots])
+
+  useEffect(() => {
+    if (filtersDisabled) {
+      setFiltersOpen(false)
+    }
+  }, [filtersDisabled])
+
+  useEffect(() => {
+    if (!filtersOpen) return
+    const handlePointerDown = (event: PointerEvent) => {
+      const panel = panelRef.current
+      if (!panel) return
+      if (!panel.contains(event.target as Node)) {
+        setFiltersOpen(false)
+      }
+    }
+    window.addEventListener('pointerdown', handlePointerDown)
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown)
+    }
+  }, [filtersOpen])
 
   const { selectionPath, selectionTrail } = useMemo(() => {
     const ids: string[] = []
@@ -217,6 +249,61 @@ export const ObjectTreePanel = ({
           {selectionTrail.length > 0 ? selectionTrail.join(' / ') : 'No selection'}
         </p>
       </header>
+      {filters.length > 0 && (
+        <div className="tree-panel__actions">
+          <button
+            type="button"
+            className={[
+              'tree-panel__filters-toggle',
+              hasActiveFilters ? 'tree-panel__filters-toggle--active' : ''
+            ]
+              .filter(Boolean)
+              .join(' ')}
+            onClick={() => setFiltersOpen((prev) => !prev)}
+            disabled={filtersDisabled}
+          >
+            Filters
+            {hasActiveFilters ? ` (${filters.filter((f) => f.active).length})` : ''}
+          </button>
+          {filtersOpen && (
+            <div className="tree-panel__filters-dropdown" role="menu">
+              <div className="tree-panel__filters-header">
+                <h3>View filters</h3>
+                <button
+                  type="button"
+                  className="tree-panel__filters-reset"
+                  onClick={() => onResetFilters?.()}
+                  disabled={!hasActiveFilters || filtersDisabled}
+                >
+                  Reset
+                </button>
+              </div>
+              <div className="tree-panel__filters-grid">
+                {filters.map((filter) => (
+                  <label
+                    key={filter.key}
+                    className={[
+                      'tree-panel__filter',
+                      filter.active ? 'tree-panel__filter--active' : ''
+                    ]
+                      .filter(Boolean)
+                      .join(' ')}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={filter.active}
+                      onChange={() => onToggleFilter?.(filter.key)}
+                      disabled={filtersDisabled}
+                    />
+                    <span>{filter.label}</span>
+                  </label>
+                ))}
+              </div>
+              <p className="tree-panel__filters-hint">Show only selected IFC types.</p>
+            </div>
+          )}
+        </div>
+      )}
       <div ref={contentRef} className="tree-panel__content">
         {hasContent ? (
           tree.roots.map((rootId) => (

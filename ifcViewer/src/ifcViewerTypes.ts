@@ -10,6 +10,12 @@ export type PropertyField = {
   value: string
 }
 
+export type HistoryEntry = {
+  ifcId: number
+  label: string
+  timestamp: string
+}
+
 export type OffsetVector = {
   dx: number
   dy: number

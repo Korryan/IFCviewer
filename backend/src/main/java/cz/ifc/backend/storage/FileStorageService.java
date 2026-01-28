@@ -3,6 +3,7 @@ package cz.ifc.backend.storage;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import cz.ifc.backend.model.FurnitureItem;
+import cz.ifc.backend.model.HistoryEntry;
 import cz.ifc.backend.model.MetadataEntry;
 import java.io.IOException;
 import java.io.InputStream;
@@ -31,6 +32,7 @@ public class FileStorageService {
   private static final Pattern PROJECT_ID_PATTERN = Pattern.compile("^[A-Za-z0-9_-]+$");
   private static final String METADATA_FILE = "metadata.json";
   private static final String FURNITURE_FILE = "furniture.json";
+  private static final String HISTORY_FILE = "history.json";
 
   // Base directory for file-backed storage.
   private final Path baseDir;
@@ -69,6 +71,18 @@ public class FileStorageService {
   public List<FurnitureItem> writeFurniture(String projectId, List<FurnitureItem> items) {
     List<FurnitureItem> normalized = normalizeFurniture(items);
     writeList(projectId, FURNITURE_FILE, normalized);
+    return normalized;
+  }
+
+  // Read project change history list from disk.
+  public List<HistoryEntry> readHistory(String projectId) {
+    return readList(projectId, HISTORY_FILE, new TypeReference<List<HistoryEntry>>() {});
+  }
+
+  // Write project change history list to disk (overwrites previous file).
+  public List<HistoryEntry> writeHistory(String projectId, List<HistoryEntry> items) {
+    List<HistoryEntry> normalized = normalizeHistory(items);
+    writeList(projectId, HISTORY_FILE, normalized);
     return normalized;
   }
 
@@ -164,6 +178,25 @@ public class FileStorageService {
         continue;
       }
       item.setUpdatedAt(now);
+      normalized.add(item);
+    }
+    return normalized;
+  }
+
+  // Normalize history list and apply server-side timestamp when missing.
+  private List<HistoryEntry> normalizeHistory(List<HistoryEntry> items) {
+    Instant now = Instant.now();
+    List<HistoryEntry> normalized = new ArrayList<>();
+    if (items == null) {
+      return normalized;
+    }
+    for (HistoryEntry item : items) {
+      if (item == null || item.getIfcId() == null || item.getLabel() == null) {
+        continue;
+      }
+      if (item.getTimestamp() == null) {
+        item.setTimestamp(now);
+      }
       normalized.add(item);
     }
     return normalized;
