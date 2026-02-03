@@ -50,7 +50,7 @@ type UseSelectionOffsetsResult = {
     modelID: number,
     expressID: number,
     options?: { highlightIds?: number[] }
-  ) => Promise<void>
+  ) => Promise<Point3D | null>
   selectCustomCube: (expressID: number) => void
   clearIfcHighlight: () => void
   getElementWorldPosition: (modelID: number, expressID: number) => Point3D | null
@@ -936,7 +936,7 @@ export const useSelectionOffsets = (
       options?: { highlightIds?: number[] }
     ) => {
       const viewer = viewerRef.current
-      if (!viewer) return
+      if (!viewer) return null
       try {
         const isRenderable = hasRenderableExpressId(modelID, expressID)
         if (isRenderable) {
@@ -955,21 +955,34 @@ export const useSelectionOffsets = (
         }
         const focusPoint = isRenderable ? getCameraFocusPoint() : null
         await fetchProperties(modelID, expressID, focusPoint)
+        const resolvedFocus = focusPoint ?? getElementWorldPosition(modelID, expressID)
+        const selectionPoint = resolvedFocus
+          ? resolvedFocus
+          : (() => {
+              const fallbackOffset =
+                elementOffsetsRef.current.get(getElementKey(modelID, expressID)) ??
+                getModelBaseOffset(modelID)
+              return { x: fallbackOffset.dx, y: fallbackOffset.dy, z: fallbackOffset.dz }
+            })()
         if (isRenderable) {
           const center = getElementWorldPosition(modelID, expressID)
           if (ENABLE_MANUAL_FOCUS_ON_SELECT && center) {
             focusOnPoint(center)
           }
         }
+        return selectionPoint
       } catch (err) {
         console.error('Failed to select IFC item by id', err)
       }
+      return null
     },
     [
       fetchProperties,
       getCameraFocusPoint,
+      getElementKey,
       focusOnPoint,
       getElementWorldPosition,
+      getModelBaseOffset,
       hasRenderableExpressId,
       viewerRef
     ]

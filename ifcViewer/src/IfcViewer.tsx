@@ -333,7 +333,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     const items = historyEntries.filter((entry) => entry.ifcId === selectedElement.expressID)
     if (stored?.updatedAt) {
       return [
-        { label: 'Saved to backend', timestamp: stored.updatedAt },
+        { ifcId: selectedElement.expressID, label: 'Saved to backend', timestamp: stored.updatedAt },
         ...items
       ]
     }
@@ -647,21 +647,6 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     [hoverCoords, insertTargetCoords, spawnUploadedModel]
   )
 
-  const getModelCenter = useCallback((modelID: number): Point3D | null => {
-    const viewer = viewerRef.current
-    if (!viewer) return null
-    const model = viewer.IFC.loader.ifcManager.state?.models?.[modelID]?.mesh
-    if (!model || !('geometry' in model)) return null
-    model.geometry.computeBoundingBox()
-    const bbox = model.geometry.boundingBox
-    if (!bbox) return null
-    const center = new Vector3()
-    bbox.getCenter(center)
-    model.updateMatrixWorld(true)
-    center.applyMatrix4(model.matrixWorld)
-    return { x: center.x, y: center.y, z: center.z }
-  }, [])
-
   const rebuildTreeForModel = useCallback(
     async (modelID: number, loadToken: number) => {
       const viewer = viewerRef.current
@@ -714,80 +699,6 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     [tree.nodes]
   )
 
-  const resolveNodePosition = useCallback(
-    (nodeId: string): Point3D | null => {
-      const node = tree.nodes[nodeId]
-      if (!node) return null
-      if (node.expressID !== null) {
-        const direct = getElementWorldPosition(node.modelID, node.expressID)
-        if (direct) return direct
-      }
-      if (node.nodeType === 'ifc') {
-        const descendantIds = collectDescendantExpressIds(nodeId)
-        for (const id of descendantIds) {
-          const pos = getElementWorldPosition(node.modelID, id)
-          if (pos) return pos
-        }
-      }
-      return null
-    },
-    [collectDescendantExpressIds, getElementWorldPosition, tree.nodes]
-  )
-
-  const nudgeTowardCamera = useCallback((point: Point3D): Point3D => {
-    const viewer = viewerRef.current
-    if (!viewer) return point
-    const camera = viewer.context.getCamera()
-    const target = new Vector3(point.x, point.y, point.z)
-    const cameraPos = new Vector3()
-    camera.getWorldPosition(cameraPos)
-    const direction = cameraPos.clone().sub(target)
-    const distance = direction.length()
-    if (distance === 0) return point
-    direction.normalize()
-    const offset = Math.min(0.6, distance * 0.25)
-    target.add(direction.multiplyScalar(offset))
-    return { x: target.x, y: target.y, z: target.z }
-  }, [])
-
-  const resolveTreeInsertTarget = useCallback(
-    (nodeId: string): Point3D => {
-      const node = tree.nodes[nodeId]
-      let target = resolveNodePosition(nodeId)
-      if (target && node?.nodeType === 'ifc') {
-        target = nudgeTowardCamera(target)
-      }
-      if (!target && node) {
-        target = getModelCenter(node.modelID)
-      }
-      if (!target) {
-        const selectedPos = getSelectedWorldPosition()
-        if (selectedPos) {
-          target = { x: selectedPos.x, y: selectedPos.y, z: selectedPos.z }
-        }
-      }
-      return target ?? hoverCoords ?? { x: 0, y: 0, z: 0 }
-    },
-    [
-      getModelCenter,
-      getSelectedWorldPosition,
-      hoverCoords,
-      nudgeTowardCamera,
-      resolveNodePosition,
-      tree.nodes
-    ]
-  )
-
-  const getCoordinatesInsertTarget = useCallback(
-    (nodeId: string): Point3D => {
-      if (selectedElement) {
-        return { x: offsetInputs.dx, y: offsetInputs.dy, z: offsetInputs.dz }
-      }
-      return resolveTreeInsertTarget(nodeId)
-    },
-    [offsetInputs, resolveTreeInsertTarget, selectedElement]
-  )
-
   const handleTreeSelect = useCallback(
     async (nodeId: string) => {
       setSelectedNodeId(nodeId)
@@ -815,8 +726,18 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   )
 
   const handleTreeAddCube = useCallback(
-    (nodeId: string) => {
-      const resolvedTarget = { x: 0, y: 0, z: 0 }
+    async (nodeId: string) => {
+      const node = tree.nodes[nodeId]
+      let target: Point3D | null = null
+
+      if (node?.nodeType === 'ifc' && node.expressID !== null) {
+        const descendantIds = collectDescendantExpressIds(nodeId)
+        target = await selectById(node.modelID, node.expressID, {
+          highlightIds: descendantIds
+        })
+      }
+
+      const resolvedTarget = target ?? { x: 0, y: 0, z: 0 }
       const info = spawnCube(resolvedTarget, { focus: true })
       if (!info) return
       registerCubeFurniture(info)
@@ -830,7 +751,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       setSelectedNodeId(newNodeId)
       selectCustomCube(info.expressID)
     },
-    [addCustomNode, registerCubeFurniture, selectCustomCube, spawnCube]
+    [addCustomNode, collectDescendantExpressIds, registerCubeFurniture, selectById, selectCustomCube, spawnCube, tree.nodes]
   )
 
   const handleTreeUploadModel = useCallback((nodeId: string) => {
