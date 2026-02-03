@@ -22,6 +22,10 @@ const buildLabel = (node: SpatialNode): string => {
   return 'IFC Item'
 }
 
+const normalizeIfcType = (type?: string): string => (type ?? '').toUpperCase()
+const isIfcType = (node: ObjectTreeNode, target: string): boolean =>
+  node.nodeType === 'ifc' && normalizeIfcType(node.type) === target
+
 const traverseSpatial = (
   node: SpatialNode,
   modelID: number,
@@ -64,6 +68,62 @@ export const buildIfcTree = (spatialRoot: SpatialNode | null | undefined, modelI
   const rootId = traverseSpatial(spatialRoot, modelID, null, acc, counter)
   acc.roots.push(rootId)
   return acc
+}
+
+export const groupIfcTreeByRoomNumber = (
+  tree: ObjectTree,
+  roomNumbers: Map<number, string>
+): ObjectTree => {
+  if (roomNumbers.size === 0) return tree
+  let changed = false
+  const nextNodes: ObjectTree['nodes'] = { ...tree.nodes }
+  const storeyNodes = Object.values(tree.nodes).filter((node) => isIfcType(node, 'IFCBUILDINGSTOREY'))
+
+  storeyNodes.forEach((storey) => {
+    if (storey.children.length === 0) return
+    const roomToSpaceId = new Map<string, string>()
+
+    storey.children.forEach((childId) => {
+      const child = tree.nodes[childId]
+      if (!child || child.expressID === null) return
+      if (!isIfcType(child, 'IFCSPACE')) return
+      const roomNumber = roomNumbers.get(child.expressID)
+      if (!roomNumber || roomToSpaceId.has(roomNumber)) return
+      roomToSpaceId.set(roomNumber, childId)
+    })
+
+    if (roomToSpaceId.size === 0) return
+
+    const removedFromStorey = new Set<string>()
+    storey.children.forEach((childId) => {
+      const child = tree.nodes[childId]
+      if (!child || child.expressID === null) return
+      if (isIfcType(child, 'IFCSPACE')) return
+      const roomNumber = roomNumbers.get(child.expressID)
+      if (!roomNumber) return
+      const spaceId = roomToSpaceId.get(roomNumber)
+      if (!spaceId) return
+      removedFromStorey.add(childId)
+      changed = true
+      nextNodes[childId] = { ...child, parentId: spaceId }
+      const currentSpace = nextNodes[spaceId] ?? tree.nodes[spaceId]
+      if (currentSpace && !currentSpace.children.includes(childId)) {
+        nextNodes[spaceId] = {
+          ...currentSpace,
+          children: [...currentSpace.children, childId]
+        }
+      }
+    })
+
+    if (removedFromStorey.size > 0) {
+      nextNodes[storey.id] = {
+        ...storey,
+        children: storey.children.filter((childId) => !removedFromStorey.has(childId))
+      }
+    }
+  })
+
+  return changed ? { nodes: nextNodes, roots: tree.roots } : tree
 }
 
 const buildCustomRoot = (modelID: number): ObjectTreeNode => ({

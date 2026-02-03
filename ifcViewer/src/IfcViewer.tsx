@@ -2,14 +2,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plane, Raycaster, Vector3 } from 'three'
 import { IfcViewerAPI } from 'web-ifc-viewer'
 import { IFCDOOR, IFCSPACE, IFCWALL } from 'web-ifc'
-import type { FurnitureItem, HistoryEntry, MetadataEntry, OffsetVector, Point3D } from './ifcViewerTypes'
+import type {
+  FurnitureItem,
+  HistoryEntry,
+  MetadataEntry,
+  ObjectTree,
+  OffsetVector,
+  Point3D
+} from './ifcViewerTypes'
 import { useSelectionOffsets, CUSTOM_CUBE_MODEL_ID } from './hooks/useSelectionOffsets'
 import { useViewerSetup } from './hooks/useViewerSetup'
 import { CoordsOverlay } from './components/CoordsOverlay'
 import { InsertMenu } from './components/InsertMenu'
 import { PropertiesPanel } from './components/PropertiesPanel'
 import { ObjectTreePanel } from './components/ObjectTreePanel'
-import { buildIfcTree, useObjectTree } from './hooks/useObjectTree'
+import { buildIfcTree, groupIfcTreeByRoomNumber, useObjectTree } from './hooks/useObjectTree'
 
 type IfcViewerProps = {
   file?: File | null
@@ -27,6 +34,94 @@ const IFC_VIEW_FILTERS = [
   { key: 'wall', label: 'IfcWall', typeId: IFCWALL },
   { key: 'door', label: 'IfcDoor', typeId: IFCDOOR }
 ] as const
+const ROOM_NUMBER_KEYS = new Set([
+  'raumnummer',
+  'roomnumber',
+  'roomno',
+  'roomnum',
+  'roomid',
+  'spacenumber',
+  'spaceno',
+  'spacenum'
+])
+
+const normalizeIfcValue = (rawValue: any): string => {
+  if (rawValue === null || rawValue === undefined) {
+    return ''
+  }
+  if (typeof rawValue === 'object') {
+    if ('value' in rawValue) {
+      return rawValue.value === null || rawValue.value === undefined ? '' : String(rawValue.value)
+    }
+    if (Array.isArray(rawValue)) {
+      return rawValue.map((entry) => normalizeIfcValue(entry)).join(', ')
+    }
+    return ''
+  }
+  return String(rawValue)
+}
+
+const normalizePropertyKey = (value: string): string =>
+  value.toLowerCase().replace(/[\s_-]+/g, '')
+
+const extractRoomNumber = (properties: any): string | null => {
+  const psets = Array.isArray(properties?.psets) ? properties.psets : []
+  for (const pset of psets) {
+    const props = Array.isArray(pset?.HasProperties) ? pset.HasProperties : []
+    for (const prop of props) {
+      const rawName = normalizeIfcValue(prop?.Name)
+      if (!rawName) continue
+      const normalizedName = normalizePropertyKey(rawName)
+      if (!ROOM_NUMBER_KEYS.has(normalizedName)) continue
+      const rawValue =
+        prop?.NominalValue ?? prop?.Value ?? prop?.value ?? prop?.RealValue ?? prop?.IntegerValue ?? prop
+      const resolved = normalizeIfcValue(rawValue)
+      if (resolved) return resolved
+    }
+  }
+  return null
+}
+
+const collectStoreyChildExpressIds = (tree: ObjectTree): number[] => {
+  const ids = new Set<number>()
+  Object.values(tree.nodes).forEach((node) => {
+    if (node.nodeType !== 'ifc') return
+    if (node.type.toUpperCase() !== 'IFCBUILDINGSTOREY') return
+    node.children.forEach((childId) => {
+      const child = tree.nodes[childId]
+      if (!child || child.nodeType !== 'ifc' || child.expressID === null) return
+      ids.add(child.expressID)
+    })
+  })
+  return Array.from(ids)
+}
+
+const buildRoomNumberMap = async (
+  viewer: IfcViewerAPI,
+  tree: ObjectTree,
+  modelID: number
+): Promise<Map<number, string>> => {
+  const expressIds = collectStoreyChildExpressIds(tree)
+  if (expressIds.length === 0) return new Map()
+  const results = await Promise.all(
+    expressIds.map(async (expressID) => {
+      try {
+        const properties = await viewer.IFC.getProperties(modelID, expressID, true, true)
+        const roomNumber = extractRoomNumber(properties)
+        return roomNumber ? ([expressID, roomNumber] as const) : null
+      } catch (err) {
+        console.warn('Failed to read room number for element', expressID, err)
+        return null
+      }
+    })
+  )
+  const map = new Map<number, string>()
+  results.forEach((entry) => {
+    if (!entry) return
+    map.set(entry[0], entry[1])
+  })
+  return map
+}
 
 const fetchJson = async <T,>(url: string, options?: RequestInit): Promise<T> => {
   const response = await fetch(url, options)
@@ -576,8 +671,16 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
         if (loadTokenRef.current !== loadToken) return
         const tree = buildIfcTree(spatial, modelID)
         if (loadTokenRef.current !== loadToken) return
-        setIfcTree(tree, modelID)
-        setSelectedNodeId(tree.roots[0] ?? null)
+        let groupedTree = tree
+        try {
+          const roomNumbers = await buildRoomNumberMap(viewer, tree, modelID)
+          if (loadTokenRef.current !== loadToken) return
+          groupedTree = groupIfcTreeByRoomNumber(tree, roomNumbers)
+        } catch (err) {
+          console.warn('Failed to group storey nodes by room number', err)
+        }
+        setIfcTree(groupedTree, modelID)
+        setSelectedNodeId(groupedTree.roots[0] ?? null)
       } catch (err) {
         if (loadTokenRef.current !== loadToken) return
         console.error('Failed to build IFC tree', err)
