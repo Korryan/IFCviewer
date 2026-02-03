@@ -56,10 +56,12 @@ type UseSelectionOffsetsResult = {
   getElementWorldPosition: (modelID: number, expressID: number) => Point3D | null
   moveSelectedTo: (targetOffset: OffsetVector) => void
   applyIfcElementOffset: (modelID: number, expressID: number, targetOffset: OffsetVector) => void
+  hideIfcElement: (modelID: number, expressID: number) => void
   getSelectedWorldPosition: () => Vector3 | null
   resetSelection: () => void
   clearOffsetArtifacts: (modelID?: number | null) => void
   spawnCube: (target?: Point3D | null, options?: SpawnCubeOptions) => SpawnedCubeInfo | null
+  removeCustomCube: (expressID: number) => void
   spawnUploadedModel: (
     file: File,
     target?: Point3D | null,
@@ -988,6 +990,30 @@ export const useSelectionOffsets = (
     ]
   )
 
+  const hideIfcElement = useCallback(
+    (modelID: number, expressID: number) => {
+      const viewer = viewerRef.current
+      if (!viewer) return
+      ensureBaseSubset(modelID)
+      const manager = viewer.IFC.loader.ifcManager
+      const scene = viewer.context.getScene()
+      const key = getElementKey(modelID, expressID)
+
+      manager.removeFromSubset(modelID, [expressID], BASE_SUBSET_ID)
+      manager.removeFromSubset(modelID, [expressID], getFilterSubsetId(modelID))
+
+      const moved = movedSubsetsRef.current.get(key)
+      if (moved) {
+        scene.remove(moved)
+        removePickable(viewer, moved)
+        manager.removeSubset(modelID, undefined, `${MOVED_SUBSET_PREFIX}${key}`)
+        movedSubsetsRef.current.delete(key)
+      }
+      elementOffsetsRef.current.delete(key)
+    },
+    [ensureBaseSubset, getElementKey, getFilterSubsetId, removePickable, viewerRef]
+  )
+
   const selectCustomCube = useCallback(
     (expressID: number) => {
       const cube = cubeRegistryRef.current.get(expressID)
@@ -1013,6 +1039,22 @@ export const useSelectionOffsets = (
   const clearIfcHighlight = useCallback(() => {
     viewerRef.current?.IFC.selector.unpickIfcItems()
   }, [viewerRef])
+
+  const removeCustomCube = useCallback(
+    (expressID: number) => {
+      const viewer = viewerRef.current
+      const cube = cubeRegistryRef.current.get(expressID)
+      if (!viewer || !cube) return
+      const scene = viewer.context.getScene()
+      scene.remove(cube)
+      removePickable(viewer, cube)
+      cubeRegistryRef.current.delete(expressID)
+      if (highlightedCubeRef.current === expressID) {
+        highlightedCubeRef.current = null
+      }
+    },
+    [removePickable, viewerRef]
+  )
 
   const spawnCubeAt = useCallback(
     (target?: Point3D | null, id?: number): SpawnedCubeInfo | null => {
@@ -1117,8 +1159,10 @@ export const useSelectionOffsets = (
     selectById,
     selectCustomCube,
     clearIfcHighlight,
+    removeCustomCube,
     getElementWorldPosition,
     moveSelectedTo,
+    hideIfcElement,
     getSelectedWorldPosition,
     resetSelection,
     clearOffsetArtifacts,

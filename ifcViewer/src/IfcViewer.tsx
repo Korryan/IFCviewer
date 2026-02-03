@@ -214,7 +214,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
   const dragPlaneRef = useRef<Plane | null>(null)
   const dragStartPointRef = useRef<Vector3 | null>(null)
   const dragStartOffsetRef = useRef<OffsetVector | null>(null)
-  const { tree, setIfcTree, resetTree, addCustomNode } = useObjectTree()
+  const { tree, setIfcTree, resetTree, addCustomNode, removeNode } = useObjectTree()
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [metadataEntries, setMetadataEntries] = useState<MetadataEntry[]>([])
   const [furnitureEntries, setFurnitureEntries] = useState<FurnitureItem[]>([])
@@ -243,9 +243,11 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     getElementWorldPosition,
     moveSelectedTo,
     getSelectedWorldPosition,
+    hideIfcElement,
     resetSelection,
     clearOffsetArtifacts,
     spawnCube,
+    removeCustomCube,
     spawnUploadedModel,
     applyIfcElementOffset,
     applyVisibilityFilter
@@ -256,6 +258,15 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     () => new Map(metadataEntries.map((entry) => [entry.ifcId, entry])),
     [metadataEntries]
   )
+  const deletedIfcIds = useMemo(() => {
+    const ids = new Set<number>()
+    metadataEntries.forEach((entry) => {
+      if (entry.deleted) {
+        ids.add(entry.ifcId)
+      }
+    })
+    return ids
+  }, [metadataEntries])
   const activeFilterDefs = useMemo(
     () => IFC_VIEW_FILTERS.filter((filter) => viewFilters[filter.key]),
     [viewFilters]
@@ -480,6 +491,51 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     syncSelectedIfcPosition
   ])
 
+  const handleDeleteSelected = useCallback(() => {
+    if (!selectedElement) return
+
+    if (selectedElement.modelID === CUSTOM_CUBE_MODEL_ID) {
+      const cubeId = selectedElement.expressID
+      removeCustomCube(cubeId)
+      setFurnitureEntries((prev) => prev.filter((item) => item.id !== `${CUBE_ITEM_PREFIX}${cubeId}`))
+      const nodeId = Object.values(tree.nodes).find(
+        (node) =>
+          node.nodeType === 'custom' &&
+          node.modelID === CUSTOM_CUBE_MODEL_ID &&
+          node.expressID === cubeId
+      )?.id
+      if (nodeId) {
+        removeNode(nodeId)
+      }
+      resetSelection()
+      setSelectedNodeId(null)
+      return
+    }
+
+    const ifcId = selectedElement.expressID
+    hideIfcElement(selectedElement.modelID, ifcId)
+    upsertMetadataEntry(ifcId, (existing) => ({
+      ...existing,
+      ifcId,
+      type: typeof selectedElement.type === 'string' ? selectedElement.type : existing.type,
+      deleted: true,
+      custom: existing.custom ?? {}
+    }))
+    pushHistoryEntry(ifcId, 'Marked as deleted')
+    resetSelection()
+    setSelectedNodeId(null)
+  }, [
+    hideIfcElement,
+    pushHistoryEntry,
+    removeCustomCube,
+    removeNode,
+    resetSelection,
+    selectedElement,
+    setFurnitureEntries,
+    tree.nodes,
+    upsertMetadataEntry
+  ])
+
   useEffect(() => {
     let cancelled = false
     const loadProjectData = async () => {
@@ -575,6 +631,7 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     if (!isHydrated || activeModelId === null) return
     if (offsetsRestoredRef.current === activeModelId) return
     metadataEntries.forEach((entry) => {
+      if (entry.deleted) return
       if (!entry.position) return
       applyIfcElementOffset(activeModelId, entry.ifcId, {
         dx: entry.position.x,
@@ -593,6 +650,9 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
     const applyFilters = async () => {
       if (activeFilterDefs.length === 0) {
         applyVisibilityFilter(activeModelId, null)
+        if (deletedIfcIds.size > 0) {
+          deletedIfcIds.forEach((id) => hideIfcElement(activeModelId, id))
+        }
         return
       }
       const buckets = await Promise.all(
@@ -600,13 +660,16 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
       )
       if (cancelled) return
       const merged = Array.from(new Set(buckets.flat()))
-      applyVisibilityFilter(activeModelId, merged)
+      const filtered = deletedIfcIds.size
+        ? merged.filter((id) => !deletedIfcIds.has(id))
+        : merged
+      applyVisibilityFilter(activeModelId, filtered)
     }
     void applyFilters()
     return () => {
       cancelled = true
     }
-  }, [activeFilterDefs, activeModelId, applyVisibilityFilter, getTypeIds])
+  }, [activeFilterDefs, activeModelId, applyVisibilityFilter, deletedIfcIds, getTypeIds, hideIfcElement])
 
   const updateHoverCoords = useCallback(() => {
     // Cast a ray to show world coordinates under cursor
@@ -900,6 +963,38 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
         setIsDragging(true)
         setDragAxisLock(null)
       }
+      if (isDragging && event.key.toLowerCase() === 'f') {
+        const viewer = viewerRef.current
+        const currentPos = getSelectedWorldPosition()
+        if (!viewer || !currentPos) return
+        const normal = new Vector3(0, 1, 0)
+        const plane = new Plane().setFromNormalAndCoplanarPoint(normal, currentPos)
+        let startPoint = currentPos.clone()
+        const container = containerRef.current
+        if (container) {
+          const rect = container.getBoundingClientRect()
+          const ndc = new Vector3(
+            (lastPointerPosRef.current.x / rect.width) * 2 - 1,
+            -(lastPointerPosRef.current.y / rect.height) * 2 + 1,
+            0.5
+          )
+          const raycaster = new Raycaster()
+          raycaster.setFromCamera(ndc, viewer.context.getCamera())
+          const hitPoint = new Vector3()
+          const hit = raycaster.ray.intersectPlane(plane, hitPoint)
+          if (hit) {
+            startPoint = hitPoint
+          }
+        }
+        dragPlaneRef.current = plane
+        dragStartPointRef.current = startPoint.clone()
+        dragStartOffsetRef.current = {
+          dx: offsetInputs.dx,
+          dy: offsetInputs.dy,
+          dz: offsetInputs.dz
+        }
+        setDragAxisLock(null)
+      }
       if (isDragging && ['x', 'y', 'z'].includes(event.key.toLowerCase())) {
         const key = event.key.toLowerCase() as 'x' | 'y' | 'z'
         setDragAxisLock(key)
@@ -1084,6 +1179,12 @@ const IfcViewer = ({ file, defaultModelUrl = '/test.ifc' }: IfcViewerProps) => {
               offsetInputs={offsetInputs}
               onOffsetChange={handleOffsetInputChange}
               onApplyOffset={applyOffsetAndPersist}
+              onDeleteSelected={selectedElement ? handleDeleteSelected : undefined}
+              deleteLabel={
+                selectedElement?.modelID === CUSTOM_CUBE_MODEL_ID
+                  ? 'Delete object'
+                  : 'Delete element'
+              }
               elementName={selectedElementName}
               historyEntries={selectedHistoryEntries}
               propertyFields={propertyFields}

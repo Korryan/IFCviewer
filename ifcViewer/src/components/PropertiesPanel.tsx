@@ -7,6 +7,8 @@ type PropertiesPanelProps = {
   offsetInputs: OffsetVector
   onOffsetChange: (axis: keyof OffsetVector, value: number) => void
   onApplyOffset: () => void
+  onDeleteSelected?: () => void
+  deleteLabel?: string
   elementName?: string | null
   historyEntries?: HistoryEntry[]
   propertyFields: PropertyField[]
@@ -21,6 +23,8 @@ export const PropertiesPanel = ({
   offsetInputs,
   onOffsetChange,
   onApplyOffset,
+  onDeleteSelected,
+  deleteLabel,
   elementName,
   historyEntries = [],
   propertyFields,
@@ -78,6 +82,15 @@ export const PropertiesPanel = ({
               <button type="button" className="offset-panel__apply" onClick={onApplyOffset}>
                 Apply coordinates
               </button>
+              {onDeleteSelected && (
+                <button
+                  type="button"
+                  className="offset-panel__apply"
+                  onClick={onDeleteSelected}
+                >
+                  {deleteLabel ?? 'Delete'}
+                </button>
+              )}
               <p className="properties-panel__hint">
                 Coordinates show the bottom center of the element bounding box.
               </p>

@@ -216,5 +216,35 @@ export const useObjectTree = () => {
     []
   )
 
-  return { tree, setIfcTree, resetTree, addCustomNode }
+  const removeNode = useCallback((nodeId: string) => {
+    setTree((prev) => {
+      if (!prev.nodes[nodeId]) return prev
+      const toRemove = new Set<string>()
+      const stack = [nodeId]
+      while (stack.length > 0) {
+        const current = stack.pop()
+        if (!current || toRemove.has(current)) continue
+        toRemove.add(current)
+        const node = prev.nodes[current]
+        if (node?.children?.length) {
+          stack.push(...node.children)
+        }
+      }
+
+      const nextNodes: ObjectTree['nodes'] = {}
+      Object.entries(prev.nodes).forEach(([id, node]) => {
+        if (toRemove.has(id)) return
+        const filteredChildren = node.children.filter((childId) => !toRemove.has(childId))
+        nextNodes[id] =
+          filteredChildren.length === node.children.length
+            ? node
+            : { ...node, children: filteredChildren }
+      })
+
+      const nextRoots = prev.roots.filter((rootId) => !toRemove.has(rootId))
+      return { nodes: nextNodes, roots: nextRoots }
+    })
+  }, [])
+
+  return { tree, setIfcTree, resetTree, addCustomNode, removeNode }
 }
